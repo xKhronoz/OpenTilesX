@@ -1,18 +1,23 @@
-.PHONY: build push test
+.PHONY: build build-api build-renderer build-admin test compose-up compose-down
 
-DOCKER_IMAGE=overv/openstreetmap-tile-server
+DOCKER_IMAGE ?= openstreetmap-tile-server
 
-build:
-	docker build -t ${DOCKER_IMAGE} .
+build: build-api build-renderer build-admin
 
-push: build
-	docker push ${DOCKER_IMAGE}:latest
+build-api:
+	docker build --target api -t $(DOCKER_IMAGE)-api .
 
-test: build
-	docker volume create osm-data
-	docker run --rm -v osm-data:/data/database/ ${DOCKER_IMAGE} import
-	docker run --rm -v osm-data:/data/database/ -p 8080:80 -d ${DOCKER_IMAGE} run
+build-renderer:
+	docker build --target renderer -t $(DOCKER_IMAGE)-renderer .
 
-stop:
-	docker rm -f `docker ps | grep '${DOCKER_IMAGE}' | awk '{ print $$1 }'` || true
-	docker volume rm -f osm-data
+build-admin:
+	docker build --target admin-worker -t $(DOCKER_IMAGE)-admin-worker .
+
+test:
+	python3 -m unittest discover -s tests
+
+compose-up:
+	docker compose up --build
+
+compose-down:
+	docker compose down --volumes --remove-orphans

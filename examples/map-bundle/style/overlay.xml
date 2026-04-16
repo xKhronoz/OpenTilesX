@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Map srs="+init=epsg:3857">
+  <Style name="overlay-empty">
+    <Rule />
+  </Style>
+  <Layer name="overlay-empty" srs="+init=epsg:3857">
+    <StyleName>overlay-empty</StyleName>
+  </Layer>
+</Map>

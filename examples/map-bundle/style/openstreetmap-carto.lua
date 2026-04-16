@@ -1,0 +1,1 @@
+-- Placeholder for an offline map bundle. Replace with the bundle's trusted Lua transform.

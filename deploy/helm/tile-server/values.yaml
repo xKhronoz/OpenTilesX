@@ -1,0 +1,63 @@
+image:
+  api: ghcr.io/example/openstreetmap-tile-server-api:latest
+  renderer: ghcr.io/example/openstreetmap-tile-server-renderer:latest
+  adminWorker: ghcr.io/example/openstreetmap-tile-server-admin-worker:latest
+  pullPolicy: IfNotPresent
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+database:
+  renderUrl: postgresql://render:change-me@postgres.example.internal:5432/gis
+  controlUrl: postgresql://control:change-me@postgres.example.internal:5432/gis
+  importUrl: postgresql://import:change-me@postgres.example.internal:5432/gis
+
+admin:
+  enabled: false
+  token: change-me
+
+tileStore:
+  type: filesystem
+  filesystem:
+    path: /data/tiles
+    existingClaim: ""
+    size: 100Gi
+  s3:
+    bucket: ""
+    prefix: osm
+    region: ""
+    endpointUrl: ""
+    accessKeyId: ""
+    secretAccessKey: ""
+    forcePathStyle: true
+
+mapBundle:
+  uri: file:///data/bundles/default
+  existingClaim: ""
+  mountPath: /data/bundles/default
+
+api:
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: false
+    className: ""
+    host: tiles.example.internal
+
+renderer:
+  replicas: 2
+
+adminWorker:
+  replicas: 1
+
+updates:
+  cron:
+    enabled: false
+    schedule: "*/15 * * * *"
+    changePath: /data/updates/latest.osc.gz
+    existingClaim: ""

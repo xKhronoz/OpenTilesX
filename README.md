@@ -1,306 +1,214 @@
 # openstreetmap-tile-server
 
-[![Build Status](https://travis-ci.org/Overv/openstreetmap-tile-server.svg?branch=master)](https://travis-ci.org/Overv/openstreetmap-tile-server) [![](https://images.microbadger.com/badges/image/overv/openstreetmap-tile-server.svg)](https://microbadger.com/images/overv/openstreetmap-tile-server "openstreetmap-tile-server")
-[![Docker Image Version (latest semver)](https://img.shields.io/docker/v/overv/openstreetmap-tile-server?label=docker%20image)](https://hub.docker.com/r/overv/openstreetmap-tile-server/tags)
+Cloud-native, airgap-capable OpenStreetMap raster tile server containers.
 
-This container allows you to easily set up an OpenStreetMap PNG tile server given a `.osm.pbf` file. It is based on the [latest Ubuntu 18.04 LTS guide](https://switch2osm.org/serving-tiles/manually-building-a-tile-server-18-04-lts/) from [switch2osm.org](https://switch2osm.org/) and therefore uses the default OpenStreetMap style.
+This repository now separates the tile serving, rendering, and admin/import/update planes. PostgreSQL/PostGIS is external and authoritative. Rendered tiles can be stored on a shared filesystem or in S3-compatible object storage, including OCI Object Storage.
 
-## Setting up the server
+## Architecture
 
-First create a Docker volume to hold the PostgreSQL database that will contain the OpenStreetMap data:
+See [docs/architecture.md](docs/architecture.md) for the full design, including role boundaries, storage adapters, map bundles, airgap operation, imports/updates, overlays, and deployment topologies.
 
-    docker volume create osm-data
+The image exposes role targets:
 
-Next, download an `.osm.pbf` extract from geofabrik.de for the region that you're interested in. You can then start importing it into PostgreSQL by running a container and mounting the file as `/data/region.osm.pbf`. For example:
+- `api`: serves `GET /tile/{z}/{x}/{y}.png` and `GET /tile/{layer}/{z}/{x}/{y}.png`, reads rendered tiles from the configured tile store, and enqueues missing tiles.
+- `renderer`: consumes dirty tile records, renders Mapnik PNG tiles from external PostGIS, and writes them to the configured tile store.
+- `admin-worker`: owns imports, updates, reimports, map-bundle activation, and tile expiry jobs.
+- `admin-ui`: same runtime as `api`, with admin endpoints enabled by configuration.
 
-```
-docker run \
-    -v /absolute/path/to/luxembourg.osm.pbf:/data/region.osm.pbf \
-    -v osm-data:/data/database/ \
-    overv/openstreetmap-tile-server \
-    import
-```
+The old `run` and `import` commands remain as compatibility shims:
 
-If the container exits without errors, then your data has been successfully imported and you are now ready to run the tile server.
+- `run` starts `tile-api`.
+- `import` runs a one-shot external-database import.
 
-Note that the import process requires an internet connection. The run process does not require an internet connection. If you want to run the openstreetmap-tile server on a computer that is isolated, you must first import on an internet connected computer, export the `osm-data` volume as a tarfile, and then restore the data volume on the target computer system.
+They no longer start PostgreSQL, Apache, nginx, cron, or renderd inside the tile server container.
 
-Also when running on an isolated system, the default `index.html` from the container will not work, as it requires access to the web for the leaflet packages.
+## Required Configuration
 
-### Automatic updates (optional)
+Database:
 
-If your import is an extract of the planet and has polygonal bounds associated with it, like those from [geofabrik.de](https://download.geofabrik.de/), then it is possible to set your server up for automatic updates. Make sure to reference both the OSM file and the polygon file during the `import` process to facilitate this, and also include the `UPDATES=enabled` variable:
-
-```
-docker run \
-    -e UPDATES=enabled \
-    -v /absolute/path/to/luxembourg.osm.pbf:/data/region.osm.pbf \
-    -v /absolute/path/to/luxembourg.poly:/data/region.poly \
-    -v osm-data:/data/database/ \
-    overv/openstreetmap-tile-server \
-    import
+```sh
+RENDER_DATABASE_URL=postgresql://render:secret@postgres.internal:5432/gis
+IMPORT_DATABASE_URL=postgresql://import:secret@postgres.internal:5432/gis
+CONTROL_DATABASE_URL=postgresql://control:secret@postgres.internal:5432/gis
+DATABASE_ADMIN_URL=postgresql://admin:secret@postgres.internal:5432/gis
 ```
 
-Refer to the section *Automatic updating and tile expiry* to actually enable the updates while running the tile server.
+`RENDER_DATABASE_URL` is used by the tile API and renderer. `IMPORT_DATABASE_URL` is used by import/update jobs. `CONTROL_DATABASE_URL` is optional; if omitted, metadata jobs use `IMPORT_DATABASE_URL` or `RENDER_DATABASE_URL`. `DATABASE_ADMIN_URL` is only for bootstrap.
 
-Please note: If you're not importing the whole planet, then the `.poly` file is necessary to limit automatic updates to the relevant region.
-Therefore, when you only have a `.osm.pbf` file but not a `.poly` file, you should not enable automatic updates.
+Bootstrap metadata tables once:
 
-### Letting the container download the file
-
-It is also possible to let the container download files for you rather than mounting them in advance by using the `DOWNLOAD_PBF` and `DOWNLOAD_POLY` parameters:
-
-```
-docker run \
-    -e DOWNLOAD_PBF=https://download.geofabrik.de/europe/luxembourg-latest.osm.pbf \
-    -e DOWNLOAD_POLY=https://download.geofabrik.de/europe/luxembourg.poly \
-    -v osm-data:/data/database/ \
-    overv/openstreetmap-tile-server \
-    import
+```sh
+docker run --rm \
+  -e IMPORT_DATABASE_URL=postgresql://import:secret@postgres.internal:5432/gis \
+  ghcr.io/example/openstreetmap-tile-server-admin-worker:latest \
+  bootstrap
 ```
 
-### Using an alternate style
+When `DATABASE_ADMIN_URL` is provided, bootstrap also creates the required `postgis` and `hstore` extensions if they are missing.
 
-By default the container will use openstreetmap-carto if it is not specified. However, you can modify the style at run-time. Be aware you need the style mounted at `run` AND `import` as the Lua script needs to be run:
+## Tile Storage
 
-```
-docker run \
-    -e DOWNLOAD_PBF=https://download.geofabrik.de/europe/luxembourg-latest.osm.pbf \
-    -e DOWNLOAD_POLY=https://download.geofabrik.de/europe/luxembourg.poly \
-    -e NAME_LUA=sample.lua \
-    -e NAME_STYLE=test.style \
-    -e NAME_MML=project.mml \
-    -e NAME_SQL=test.sql \
-    -v /home/user/openstreetmap-carto-modified:/data/style/ \
-    -v osm-data:/data/database/ \
-    overv/openstreetmap-tile-server \
-    import
+Filesystem:
+
+```sh
+TILE_STORE=filesystem
+TILE_FS_PATH=/data/tiles
 ```
 
-If you do not define the "NAME_*" variables, the script will default to those found in the openstreetmap-carto style.
+For Kubernetes with more than one API or renderer pod, use a `ReadWriteMany` volume.
 
-Be sure to mount the volume during `run` with the same `-v /home/user/openstreetmap-carto-modified:/data/style/`
+S3-compatible object storage:
 
-If you do not see the expected style upon `run` double check your paths as the style may not have been found at the directory specified. By default, `openstreetmap-carto` will be used if a style cannot be found
-
-**Only openstreetmap-carto and styles like it, eg, ones with one lua script, one style, one mml, one SQL can be used**
-
-## Running the server
-
-Run the server like this:
-
-```
-docker run \
-    -p 8080:80 \
-    -v osm-data:/data/database/ \
-    -d overv/openstreetmap-tile-server \
-    run
+```sh
+TILE_STORE=s3
+S3_BUCKET=tiles
+S3_PREFIX=osm
+S3_REGION=us-ashburn-1
+S3_ENDPOINT_URL=https://namespace.compat.objectstorage.us-ashburn-1.oraclecloud.com
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+S3_FORCE_PATH_STYLE=true
 ```
 
-Your tiles will now be available at `http://localhost:8080/tile/{z}/{x}/{y}.png`. The demo map in `leaflet-demo.html` will then be available on `http://localhost:8080`. Note that it will initially take quite a bit of time to render the larger tiles for the first time.
+The runtime uses object API calls directly. It does not mount object storage with `s3fs`.
 
-### Using Docker Compose
+## Airgap Runtime
 
-The `docker-compose.yml` file included with this repository shows how the aforementioned command can be used with Docker Compose to run your server.
+Runtime imports never download a public sample PBF, style asset, font, favicon, Leaflet bundle, or replication feed implicitly. Isolated deployments must provide inputs from local paths, internal object storage, or internal HTTP mirrors.
 
-### Preserving rendered tiles
+Map-specific assets are packaged as an offline map bundle:
 
-Tiles that have already been rendered will be stored in `/data/tiles/`. To make sure that this data survives container restarts, you should create another volume for it:
-
-```
-docker volume create osm-tiles
-docker run \
-    -p 8080:80 \
-    -v osm-data:/data/database/ \
-    -v osm-tiles:/data/tiles/ \
-    -d overv/openstreetmap-tile-server \
-    run
+```sh
+MAP_BUNDLE_URI=file:///data/bundles/default
 ```
 
-**If you do this, then make sure to also run the import with the `osm-tiles` volume to make sure that caching works properly across updates!**
+A bundle contains:
 
-### Enabling automatic updating (optional)
+- `manifest.json`, `manifest.yaml`, or `map-bundle.yaml`
+- prebuilt `style.mapnikXml`
+- osm2pgsql Lua/style/index SQL files
+- fonts, symbols, sprites, and external data
+- optional PBF/poly references
+- baked overlay definitions and optional separate overlay layers
 
-Given that you've set up your import as described in the *Automatic updates* section during server setup, you can enable the updating process by setting the `UPDATES` variable while running your server as well:
+Separate overlay layers can define their own `layers[].style.mapnikXml`; otherwise they fall back to the bundle default style.
 
-```
-docker run \
-    -p 8080:80 \
-    -e REPLICATION_URL=https://planet.openstreetmap.org/replication/minute/ \
-    -e MAX_INTERVAL_SECONDS=60 \
-    -e UPDATES=enabled \
-    -v osm-data:/data/database/ \
-    -v osm-tiles:/data/tiles/ \
-    -d overv/openstreetmap-tile-server \
-    run
-```
+`map-bundle/activate` records the active bundle and checksum in `tile_admin.settings`. New API/renderer pods use that active bundle if `MAP_BUNDLE_URI` is not set explicitly.
 
-This will enable a background process that automatically downloads changes from the OpenStreetMap server, filters them for the relevant region polygon you specified, updates the database and finally marks the affected tiles for rerendering.
+Validate a bundle:
 
-### Tile expiration (optional)
-
-Specify custom tile expiration settings to control which zoom level tiles are marked as expired when an update is performed. Tiles can be marked as expired in the cache (TOUCHFROM), but will still be served
-until a new tile has been rendered, or deleted from the cache (DELETEFROM), so nothing will be served until a new tile has been rendered.
-
-The example tile expiration values below are the default values.
-
-```
-docker run \
-    -p 8080:80 \
-    -e REPLICATION_URL=https://planet.openstreetmap.org/replication/minute/ \
-    -e MAX_INTERVAL_SECONDS=60 \
-    -e UPDATES=enabled \
-    -e EXPIRY_MINZOOM=13 \
-    -e EXPIRY_TOUCHFROM=13 \
-    -e EXPIRY_DELETEFROM=19 \
-    -e EXPIRY_MAXZOOM=20 \
-    -v osm-data:/data/database/ \
-    -v osm-tiles:/data/tiles/ \
-    -d overv/openstreetmap-tile-server \
-    run
+```sh
+docker run --rm \
+  -v "$PWD/examples/map-bundle:/data/bundles/default:ro" \
+  ghcr.io/example/openstreetmap-tile-server-api:latest \
+  validate-bundle file:///data/bundles/default
 ```
 
-### Cross-origin resource sharing
+HTTP bundle URLs are disabled by default. Set `ALLOW_NETWORK_FETCH=true` only when pointing at an approved internal mirror.
 
-To enable the `Access-Control-Allow-Origin` header to be able to retrieve tiles from other domains, simply set the `ALLOW_CORS` variable to `enabled`:
+## Admin API
 
-```
-docker run \
-    -p 8080:80 \
-    -v osm-data:/data/database/ \
-    -e ALLOW_CORS=enabled \
-    -d overv/openstreetmap-tile-server \
-    run
+Admin endpoints are disabled by default. Enable them on the API role:
+
+```sh
+ADMIN_ENABLED=true
+ADMIN_TOKEN=change-me
 ```
 
-### Connecting to Postgres
+Admin mode also needs `CONTROL_DATABASE_URL` or `IMPORT_DATABASE_URL` because it creates jobs.
 
-To connect to the PostgreSQL database inside the container, make sure to expose port 5432:
+When enabled, the browser control panel is available at `/admin`. It is self-contained and does not load external assets.
 
-```
-docker run \
-    -p 8080:80 \
-    -p 5432:5432 \
-    -v osm-data:/data/database/ \
-    -d overv/openstreetmap-tile-server \
-    run
-```
+Create jobs:
 
-Use the user `renderer` and the database `gis` to connect.
+```sh
+curl -X POST http://localhost:8080/admin/jobs/import \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"pbf_uri":"/data/import/region.osm.pbf","lua":"/data/bundles/default/style/openstreetmap-carto.lua","style_file":"/data/bundles/default/style/openstreetmap-carto.style"}'
 
-```
-psql -h localhost -U renderer gis
-```
+curl -X POST http://localhost:8080/admin/jobs/reimport \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"pbf_uri":"/data/import/region.osm.pbf","replace_strategy":"blue_green"}'
 
-The default password is `renderer`, but it can be changed using the `PGPASSWORD` environment variable:
+curl -X POST http://localhost:8080/admin/jobs/update \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"change_uri":"/data/updates/latest.osc.gz"}'
 
-```
-docker run \
-    -p 8080:80 \
-    -p 5432:5432 \
-    -e PGPASSWORD=secret \
-    -v osm-data:/data/database/ \
-    -d overv/openstreetmap-tile-server \
-    run
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8080/admin/jobs/{job-id}
 ```
 
-## Performance tuning and tweaking
+`osm2pgsql --append` is only used for change files. Full `.osm.pbf` files use replace/reimport.
 
-Details for update procedure and invoked scripts can be found here [link](https://ircama.github.io/osm-carto-tutorials/updating-data/).
+## Reimport Strategies
 
-### THREADS
+- `blue_green`: import into a new schema, validate, then update the active schema metadata. This is the default for lower downtime.
+- `in_place`: recreate active OSM tables directly. This uses less storage but can degrade or interrupt rendering while the job runs.
 
-The import and tile serving processes use 4 threads by default, but this number can be changed by setting the `THREADS` environment variable. For example:
-```
-docker run \
-    -p 8080:80 \
-    -e THREADS=24 \
-    -v osm-data:/data/database/ \
-    -d overv/openstreetmap-tile-server \
-    run
-```
+## Local Compose
 
-### CACHE
+Filesystem tile cache:
 
-The import and tile serving processes use 800 MB RAM cache by default, but this number can be changed by option -C. For example:
-```
-docker run \
-    -p 8080:80 \
-    -e "OSM2PGSQL_EXTRA_ARGS=-C 4096" \
-    -v osm-data:/data/database/ \
-    -d overv/openstreetmap-tile-server \
-    run
+```sh
+docker compose up --build
 ```
 
-### AUTOVACUUM
+S3-compatible cache using MinIO:
 
-The database use the autovacuum feature by default. This behavior can be changed with `AUTOVACUUM` environment variable. For example:
-```
-docker run \
-    -p 8080:80 \
-    -e AUTOVACUUM=off \
-    -v osm-data:/data/database/ \
-    -d overv/openstreetmap-tile-server \
-    run
+```sh
+docker compose -f deploy/docker-compose.s3.yml up --build
 ```
 
-### FLAT_NODES
+Place offline import files under `./data/import` before creating import jobs.
 
-If you are planning to import the entire planet or you are running into memory errors then you may want to enable the `--flat-nodes` option for osm2pgsql. You can then use it during the import process as follows:
+## Kubernetes and Helm
 
+Static manifests are in `deploy/kubernetes/tile-server.yaml`.
+
+Helm chart:
+
+```sh
+helm install osm-tiles deploy/helm/tile-server \
+  --set mapBundle.existingClaim=osm-map-bundle \
+  --set database.renderUrl='postgresql://render:secret@postgres.internal:5432/gis' \
+  --set database.controlUrl='postgresql://control:secret@postgres.internal:5432/gis' \
+  --set database.importUrl='postgresql://import:secret@postgres.internal:5432/gis'
 ```
-docker run \
-    -v /absolute/path/to/luxembourg.osm.pbf:/data/region.osm.pbf \
-    -v osm-data:/data/database/ \
-    -e "FLAT_NODES=enabled" \
-    overv/openstreetmap-tile-server \
-    import
+
+Use S3 mode by setting `tileStore.type=s3` and the `tileStore.s3.*` values. For filesystem mode, provide or let the chart create a `ReadWriteMany` tile PVC.
+
+Containers run as UID/GID `1000`; externally provisioned PVCs and bind mounts must be writable by that ID.
+
+## Airgap Release Flow
+
+1. Build and export role images in a connected environment:
+
+   ```sh
+   docker build --target api -t osm-tile-api:airgap .
+   docker build --target renderer -t osm-tile-renderer:airgap .
+   docker build --target admin-worker -t osm-tile-admin-worker:airgap .
+   docker save osm-tile-api:airgap osm-tile-renderer:airgap osm-tile-admin-worker:airgap -o osm-tile-images.tar
+   ```
+
+2. Assemble a local map bundle inside the isolated environment if the map cannot leave it.
+3. Transfer only approved artifacts into the isolated environment: image tarball, manifests/chart, PBF/poly/change files, map bundle, and checksums.
+4. Load images, bootstrap metadata, validate the bundle, import local data, then start API and render workers.
+
+## Development
+
+Run unit tests:
+
+```sh
+python3 -m unittest discover -s tests
 ```
 
-Warning: enabling `FLAT_NOTES` together with `UPDATES` only works for entire planet imports (without a `.poly` file).  Otherwise this will break the automatic update script. This is because trimming the differential updates to the specific regions currently isn't supported when using flat nodes.
+Build role images:
 
-### Benchmarks
-
-You can find an example of the import performance to expect with this image on the [OpenStreetMap wiki](https://wiki.openstreetmap.org/wiki/Osm2pgsql/benchmarks#debian_9_.2F_openstreetmap-tile-server).
-
-## Troubleshooting
-
-### ERROR: could not resize shared memory segment / No space left on device
-
-If you encounter such entries in the log, it will mean that the default shared memory limit (64 MB) is too low for the container and it should be raised:
+```sh
+make build
 ```
-renderd[121]: ERROR: failed to render TILE default 2 0-3 0-3
-renderd[121]: reason: Postgis Plugin: ERROR: could not resize shared memory segment "/PostgreSQL.790133961" to 12615680 bytes: ### No space left on device
-```
-To raise it use `--shm-size` parameter. For example:
-```
-docker run \
-    -p 8080:80 \
-    -v osm-data:/data/database/ \
-    --shm-size="192m" \
-    -d overv/openstreetmap-tile-server \
-    run
-```
-For too high values you may notice excessive CPU load and memory usage. It might be that you will have to experimentally find the best values for yourself.
 
-### The import process unexpectedly exits
-
-You may be running into problems with memory usage during the import. Have a look at the "Flat nodes" section in this README.
-
-## License
-
-```
-Copyright 2019 Alexander Overvoorde
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+The CI workflow builds `api`, `renderer`, `admin-worker`, and `admin-ui` targets for amd64 and arm64.

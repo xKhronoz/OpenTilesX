@@ -1,174 +1,162 @@
-FROM ubuntu:22.04 AS compiler-common
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG C.UTF-8
-ENV LC_ALL C.UTF-8
+# syntax=docker/dockerfile:1.7
 
-RUN apt-get update \
-&& apt-get install -y --no-install-recommends \
- ca-certificates gnupg lsb-release locales \
- wget curl \
- git-core unzip unrar \
-&& locale-gen $LANG && update-locale LANG=$LANG \
-&& sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list' \
-&& wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
-&& apt-get update && apt-get -y upgrade
+ARG CARTO_VERSION=1.2.0
+ARG OSM_CARTO_VERSION=v5.4.0
+ARG PG_VERSION=15
 
-###########################################################################################################
+FROM debian:bookworm-slim AS builder-common
 
-FROM compiler-common AS compiler-stylesheet
-RUN cd ~ \
-&& git clone --single-branch --branch v5.4.0 https://github.com/gravitystorm/openstreetmap-carto.git --depth 1 \
-&& cd openstreetmap-carto \
-&& sed -i 's/, "unifont Medium", "Unifont Upper Medium"//g' style/fonts.mss \
-&& sed -i 's/"Noto Sans Tibetan Regular",//g' style/fonts.mss \
-&& sed -i 's/"Noto Sans Tibetan Bold",//g' style/fonts.mss \
-&& sed -i 's/Noto Sans Syriac Eastern Regular/Noto Sans Syriac Regular/g' style/fonts.mss \
-&& rm -rf .git
+ARG CARTO_VERSION
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
-###########################################################################################################
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        npm
 
-FROM compiler-common AS compiler-helper-script
-RUN mkdir -p /home/renderer/src \
-&& cd /home/renderer/src \
-&& git clone https://github.com/zverik/regional \
-&& cd regional \
-&& rm -rf .git \
-&& chmod u+x /home/renderer/src/regional/trim_osc.py
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g "carto@${CARTO_VERSION}"
 
 ###########################################################################################################
 
-FROM compiler-common AS final
+FROM builder-common AS compiler-stylesheet
 
-# Based on
-# https://switch2osm.org/serving-tiles/manually-building-a-tile-server-18-04-lts/
-ENV DEBIAN_FRONTEND=noninteractive
-ENV AUTOVACUUM=on
-ENV UPDATES=disabled
-ENV REPLICATION_URL=https://planet.openstreetmap.org/replication/hour/
-ENV MAX_INTERVAL_SECONDS=3600
-ENV PG_VERSION 15
+ARG OSM_CARTO_VERSION
+WORKDIR /root/openstreetmap-carto
 
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+RUN git clone --single-branch --branch "$OSM_CARTO_VERSION" https://github.com/gravitystorm/openstreetmap-carto.git --depth 1 . \
+ && sed -i 's/, "unifont Medium", "Unifont Upper Medium"//g' style/fonts.mss \
+ && sed -i 's/"Noto Sans Tibetan Regular",//g' style/fonts.mss \
+ && sed -i 's/"Noto Sans Tibetan Bold",//g' style/fonts.mss \
+ && sed -i 's/Noto Sans Syriac Eastern Regular/Noto Sans Syriac Regular/g' style/fonts.mss \
+ && carto project.mml > mapnik.xml \
+ && rm -rf .git
 
-# Get packages
-RUN apt-get update \
-&& apt-get install -y --no-install-recommends \
- apache2 \
- cron \
- dateutils \
- fonts-hanazono \
- fonts-noto-cjk \
- fonts-noto-hinted \
- fonts-noto-unhinted \
- fonts-unifont \
- gnupg2 \
- gdal-bin \
- liblua5.3-dev \
- lua5.3 \
- mapnik-utils \
- npm \
- osm2pgsql \
- osmium-tool \
- osmosis \
- postgresql-$PG_VERSION \
- postgresql-$PG_VERSION-postgis-3 \
- postgresql-$PG_VERSION-postgis-3-scripts \
- postgis \
- python-is-python3 \
- python3-mapnik \
- python3-lxml \
- python3-psycopg2 \
- python3-shapely \
- python3-pip \
- renderd \
- sudo \
- vim \
-&& apt-get clean autoclean \
-&& apt-get autoremove --yes \
-&& rm -rf /var/lib/{apt,dpkg,cache,log}/
+###########################################################################################################
 
-RUN adduser --disabled-password --gecos "" renderer
+FROM builder-common AS compiler-helper-script
 
-# Get Noto Emoji Regular font, despite it being deprecated by Google
-RUN wget https://github.com/googlefonts/noto-emoji/blob/9a5261d871451f9b5183c93483cbd68ed916b1e9/fonts/NotoEmoji-Regular.ttf?raw=true --content-disposition -P /usr/share/fonts/
+WORKDIR /home/renderer/src/regional
 
-# For some reason this one is missing in the default packages
-RUN wget https://github.com/stamen/terrain-classic/blob/master/fonts/unifont-Medium.ttf?raw=true --content-disposition -P /usr/share/fonts/
+RUN git clone https://github.com/zverik/regional . \
+ && rm -rf .git \
+ && chmod u+x trim_osc.py
 
-# Install python libraries
-RUN pip3 install \
- requests \
- osmium \
- pyyaml
+###########################################################################################################
 
-# Install carto for stylesheet
-RUN npm install -g carto@1.2.0
+FROM builder-common AS font-builder
 
-# Configure Apache
-RUN echo "LoadModule tile_module /usr/lib/apache2/modules/mod_tile.so" >> /etc/apache2/conf-available/mod_tile.conf \
-&& echo "LoadModule headers_module /usr/lib/apache2/modules/mod_headers.so" >> /etc/apache2/conf-available/mod_headers.conf \
-&& a2enconf mod_tile && a2enconf mod_headers
-COPY apache.conf /etc/apache2/sites-available/000-default.conf
-RUN ln -sf /dev/stdout /var/log/apache2/access.log \
-&& ln -sf /dev/stderr /var/log/apache2/error.log
+WORKDIR /tmp/fonts
 
-# leaflet
-COPY leaflet-demo.html /var/www/html/index.html
-RUN cd /var/www/html/ \
-&& wget https://github.com/Leaflet/Leaflet/releases/download/v1.8.0/leaflet.zip \
-&& unzip leaflet.zip \
-&& rm leaflet.zip
+RUN curl -fL -o NotoEmoji-Regular.ttf "https://github.com/googlefonts/noto-emoji/blob/9a5261d871451f9b5183c93483cbd68ed916b1e9/fonts/NotoEmoji-Regular.ttf?raw=true" \
+ && curl -fL -o unifont-Medium.ttf "https://github.com/stamen/terrain-classic/blob/master/fonts/unifont-Medium.ttf?raw=true"
 
-# Icon
-RUN wget -O /var/www/html/favicon.ico https://www.openstreetmap.org/favicon.ico
+###########################################################################################################
 
-# Copy update scripts
-COPY openstreetmap-tiles-update-expire.sh /usr/bin/
-RUN chmod +x /usr/bin/openstreetmap-tiles-update-expire.sh \
-&& mkdir /var/log/tiles \
-&& chmod a+rw /var/log/tiles \
-&& ln -s /home/renderer/src/mod_tile/osmosis-db_replag /usr/bin/osmosis-db_replag \
-&& echo "* * * * *   renderer    openstreetmap-tiles-update-expire.sh\n" >> /etc/crontab
+FROM debian:bookworm-slim AS runtime
 
-# Configure PosgtreSQL
-COPY postgresql.custom.conf.tmpl /etc/postgresql/$PG_VERSION/main/
-RUN chown -R postgres:postgres /var/lib/postgresql \
-&& chown postgres:postgres /etc/postgresql/$PG_VERSION/main/postgresql.custom.conf.tmpl \
-&& echo "host all all 0.0.0.0/0 scram-sha-256" >> /etc/postgresql/$PG_VERSION/main/pg_hba.conf \
-&& echo "host all all ::/0 scram-sha-256" >> /etc/postgresql/$PG_VERSION/main/pg_hba.conf
+ARG PG_VERSION
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    VIRTUAL_ENV=/opt/tile-server-venv \
+    PATH=/opt/tile-server-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/app \
+    TILE_STORE=filesystem \
+    TILE_FS_PATH=/data/tiles \
+    MAP_VERSION=default \
+    DEFAULT_LAYER=default \
+    LISTEN_HOST=0.0.0.0 \
+    LISTEN_PORT=8080 \
+    THREADS=4 \
+    TZ=UTC
 
-# Create volume directories
-RUN mkdir -p /run/renderd/ \
-  &&  mkdir  -p  /data/database/  \
-  &&  mkdir  -p  /data/style/  \
-  &&  mkdir  -p  /home/renderer/src/  \
-  &&  chown  -R  renderer:  /data/  \
-  &&  chown  -R  renderer:  /home/renderer/src/  \
-  &&  chown  -R  renderer:  /run/renderd  \
-  &&  mv  /var/lib/postgresql/$PG_VERSION/main/  /data/database/postgres/  \
-  &&  mv  /var/cache/renderd/tiles/            /data/tiles/     \
-  &&  chown  -R  renderer: /data/tiles \
-  &&  ln  -s  /data/database/postgres  /var/lib/postgresql/$PG_VERSION/main             \
-  &&  ln  -s  /data/style              /home/renderer/src/openstreetmap-carto  \
-  &&  ln  -s  /data/tiles              /var/cache/renderd/tiles                \
-;
+RUN ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime \
+ && echo "$TZ" > /etc/timezone
 
-RUN echo '[default] \n\
-URI=/tile/ \n\
-TILEDIR=/var/cache/renderd/tiles \n\
-XML=/home/renderer/src/openstreetmap-carto/mapnik.xml \n\
-HOST=localhost \n\
-TILESIZE=256 \n\
-MAXZOOM=20' >> /etc/renderd.conf \
- && sed -i 's,/usr/share/fonts/truetype,/usr/share/fonts,g' /etc/renderd.conf
+# Runtime deliberately excludes PostgreSQL server, Apache, nginx, cron, renderd,
+# sudo, vim, npm, and git. PostgreSQL/PostGIS is external; ingress/proxying
+# belongs to deployment infrastructure.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,target=/root/.cache/pip \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dateutils \
+        fonts-hanazono \
+        fonts-noto-cjk \
+        fonts-noto-hinted \
+        fonts-noto-unhinted \
+        fonts-unifont \
+        gdal-bin \
+        liblua5.3-0 \
+        lua5.3 \
+        mapnik-utils \
+        osm2pgsql \
+        osmium-tool \
+        osmosis \
+        postgresql-client-${PG_VERSION} \
+        python-is-python3 \
+        python3-lxml \
+        python3-mapnik \
+        python3-pip \
+        python3-psycopg2 \
+        python3-shapely \
+        python3-venv \
+        tini; \
+    python3 -m venv --system-site-packages "$VIRTUAL_ENV"; \
+    "$VIRTUAL_ENV/bin/pip" install \
+        boto3 \
+        osmium \
+        pyyaml \
+        requests; \
+    apt-get purge -y --auto-remove \
+        python3-pip \
+        python3-pip-whl \
+        python3-setuptools \
+        python3-setuptools-whl \
+        python3-venv \
+        python3-wheel
 
-# Install helper script
-COPY --from=compiler-helper-script /home/renderer/src/regional /home/renderer/src/regional
+RUN adduser --uid 1000 --disabled-password --gecos "" renderer \
+ && mkdir -p /data/tiles /data/style /data/import /data/bundles /tmp/tile-server /app \
+ && chown -R renderer:renderer /data /tmp/tile-server /app /home/renderer
 
-COPY --from=compiler-stylesheet /root/openstreetmap-carto /home/renderer/src/openstreetmap-carto-backup
+COPY --from=font-builder /tmp/fonts/NotoEmoji-Regular.ttf /usr/share/fonts/NotoEmoji-Regular.ttf
+COPY --from=font-builder /tmp/fonts/unifont-Medium.ttf /usr/share/fonts/unifont-Medium.ttf
+COPY --from=compiler-helper-script --chown=renderer:renderer /home/renderer/src/regional /home/renderer/src/regional
+COPY --from=compiler-stylesheet --chown=renderer:renderer /root/openstreetmap-carto /opt/openstreetmap-carto-default
+COPY --chown=renderer:renderer tile_server /app/tile_server
+COPY --chown=renderer:renderer --chmod=755 run.sh /run.sh
 
-# Start running
-COPY run.sh /
-ENTRYPOINT ["/run.sh"]
-CMD []
-EXPOSE 80 5432
+USER renderer
+WORKDIR /app
+ENTRYPOINT ["/usr/bin/tini", "--", "/run.sh"]
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/run.sh", "healthcheck"]
+
+FROM runtime AS api
+ENV TILE_SERVER_ROLE=tile-api
+CMD ["tile-api"]
+
+FROM runtime AS renderer
+ENV TILE_SERVER_ROLE=render-worker
+CMD ["render-worker"]
+
+FROM runtime AS admin-worker
+ENV TILE_SERVER_ROLE=admin-worker
+CMD ["admin-worker"]
+
+FROM api AS admin-ui
+ENV TILE_SERVER_ROLE=admin-ui
+
+FROM api AS final

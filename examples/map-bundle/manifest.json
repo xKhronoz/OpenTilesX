@@ -1,0 +1,33 @@
+{
+  "apiVersion": "tileserver.openstreetmap.local/v1",
+  "name": "default-offline-map",
+  "version": "2026.04",
+  "style": {
+    "directory": "style",
+    "mapnikXml": "mapnik.xml",
+    "lua": "openstreetmap-carto.lua",
+    "styleFile": "openstreetmap-carto.style",
+    "indexesSql": "indexes.sql"
+  },
+  "layers": [
+    {
+      "name": "default",
+      "mode": "baked"
+    },
+    {
+      "name": "overlay",
+      "mode": "separate",
+      "style": {
+        "directory": "style",
+        "mapnikXml": "overlay.xml"
+      }
+    }
+  ],
+  "overlays": [
+    {
+      "name": "overlay",
+      "mode": "separate",
+      "source": "overlays/overlay.gpkg"
+    }
+  ]
+}

@@ -1,14 +1,87 @@
-version: '3'
+version: "3.8"
 
 services:
-  map:
-    image: overv/openstreetmap-tile-server
+  postgis:
+    image: postgis/postgis:15-3.4
+    environment:
+      POSTGRES_DB: gis
+      POSTGRES_USER: osm
+      POSTGRES_PASSWORD: osm
     volumes:
-      - osm-data:/data/database/
+      - postgis-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osm -d gis"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  bootstrap:
+    build:
+      context: .
+      target: admin-worker
+    command: bootstrap
+    environment:
+      IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      DATABASE_ADMIN_URL: postgresql://osm:osm@postgis:5432/gis
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+  tile-api:
+    build:
+      context: .
+      target: api
+    environment:
+      RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      TILE_STORE: filesystem
+      TILE_FS_PATH: /data/tiles
+      MAP_BUNDLE_URI: file:///data/bundles/default
+      ADMIN_ENABLED: "true"
+      ADMIN_TOKEN: change-me
+    volumes:
+      - tile-cache:/data/tiles
+      - ./examples/map-bundle:/data/bundles/default:ro
     ports:
-      - "8080:80"
-    command: "run"
+      - "8080:8080"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  render-worker:
+    build:
+      context: .
+      target: renderer
+    environment:
+      RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      TILE_STORE: filesystem
+      TILE_FS_PATH: /data/tiles
+      MAP_BUNDLE_URI: file:///data/bundles/default
+    volumes:
+      - tile-cache:/data/tiles
+      - ./examples/map-bundle:/data/bundles/default:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  admin-worker:
+    build:
+      context: .
+      target: admin-worker
+    environment:
+      IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      TILE_STORE: filesystem
+      TILE_FS_PATH: /data/tiles
+      MAP_BUNDLE_URI: file:///data/bundles/default
+    volumes:
+      - tile-cache:/data/tiles
+      - ./data/import:/data/import:ro
+      - ./examples/map-bundle:/data/bundles/default:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
 
 volumes:
-  osm-data:
-    external: true
+  postgis-data:
+  tile-cache:

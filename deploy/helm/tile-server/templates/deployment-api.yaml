@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tile-server.fullname" . }}-api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tile-server.fullname" . }}-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "tile-server.fullname" . }}-api
+    spec:
+      securityContext:
+{{ toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          image: {{ .Values.image.api | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "tile-server.fullname" . }}-config
+            - secretRef:
+                name: {{ include "tile-server.fullname" . }}-secrets
+          env:
+            - name: ADMIN_ENABLED
+              value: {{ .Values.admin.enabled | quote }}
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          volumeMounts:
+            {{- if eq .Values.tileStore.type "filesystem" }}
+            - name: tile-cache
+              mountPath: {{ .Values.tileStore.filesystem.path | quote }}
+            {{- end }}
+            - name: map-bundle
+              mountPath: {{ .Values.mapBundle.mountPath | quote }}
+              readOnly: true
+      volumes:
+        {{- if eq .Values.tileStore.type "filesystem" }}
+        - name: tile-cache
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-tiles" (include "tile-server.fullname" .)) .Values.tileStore.filesystem.existingClaim }}
+        {{- end }}
+        - name: map-bundle
+          persistentVolumeClaim:
+            claimName: {{ .Values.mapBundle.existingClaim | required "mapBundle.existingClaim is required" }}

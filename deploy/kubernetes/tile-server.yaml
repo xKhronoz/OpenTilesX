@@ -1,0 +1,228 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osm-tile-server-config
+data:
+  TILE_STORE: filesystem
+  TILE_FS_PATH: /data/tiles
+  MAP_BUNDLE_URI: file:///data/bundles/default
+  DEFAULT_LAYER: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: osm-tile-server-secrets
+type: Opaque
+stringData:
+  RENDER_DATABASE_URL: postgresql://render:change-me@postgres.example.internal:5432/gis
+  CONTROL_DATABASE_URL: postgresql://control:change-me@postgres.example.internal:5432/gis
+  IMPORT_DATABASE_URL: postgresql://import:change-me@postgres.example.internal:5432/gis
+  ADMIN_TOKEN: change-me
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: osm-map-bundle
+spec:
+  accessModes: ["ReadOnlyMany"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: osm-tile-cache
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: osm-tile-api
+spec:
+  selector:
+    app: osm-tile-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: osm-tile-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: osm-tile-api
+  template:
+    metadata:
+      labels:
+        app: osm-tile-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: api
+          image: ghcr.io/example/openstreetmap-tile-server-api:latest
+          envFrom:
+            - configMapRef:
+                name: osm-tile-server-config
+            - secretRef:
+                name: osm-tile-server-secrets
+          env:
+            - name: ADMIN_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: tile-cache
+              mountPath: /data/tiles
+            - name: map-bundle
+              mountPath: /data/bundles/default
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+      volumes:
+        - name: tile-cache
+          persistentVolumeClaim:
+            claimName: osm-tile-cache
+        - name: map-bundle
+          persistentVolumeClaim:
+            claimName: osm-map-bundle
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: osm-render-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: osm-render-worker
+  template:
+    metadata:
+      labels:
+        app: osm-render-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: renderer
+          image: ghcr.io/example/openstreetmap-tile-server-renderer:latest
+          envFrom:
+            - configMapRef:
+                name: osm-tile-server-config
+            - secretRef:
+                name: osm-tile-server-secrets
+          volumeMounts:
+            - name: tile-cache
+              mountPath: /data/tiles
+            - name: map-bundle
+              mountPath: /data/bundles/default
+              readOnly: true
+      volumes:
+        - name: tile-cache
+          persistentVolumeClaim:
+            claimName: osm-tile-cache
+        - name: map-bundle
+          persistentVolumeClaim:
+            claimName: osm-map-bundle
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: osm-admin-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: osm-admin-worker
+  template:
+    metadata:
+      labels:
+        app: osm-admin-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: admin-worker
+          image: ghcr.io/example/openstreetmap-tile-server-admin-worker:latest
+          envFrom:
+            - configMapRef:
+                name: osm-tile-server-config
+            - secretRef:
+                name: osm-tile-server-secrets
+          volumeMounts:
+            - name: import-data
+              mountPath: /data/import
+              readOnly: true
+            - name: tile-cache
+              mountPath: /data/tiles
+            - name: map-bundle
+              mountPath: /data/bundles/default
+              readOnly: true
+      volumes:
+        - name: import-data
+          persistentVolumeClaim:
+            claimName: osm-import-data
+        - name: tile-cache
+          persistentVolumeClaim:
+            claimName: osm-tile-cache
+        - name: map-bundle
+          persistentVolumeClaim:
+            claimName: osm-map-bundle
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: osm-update-feed
+spec:
+  schedule: "*/15 * * * *"
+  suspend: true
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          restartPolicy: OnFailure
+          containers:
+            - name: enqueue-update
+              image: ghcr.io/example/openstreetmap-tile-server-admin-worker:latest
+              command: ["/run.sh", "update-once"]
+              envFrom:
+                - configMapRef:
+                    name: osm-tile-server-config
+                - secretRef:
+                    name: osm-tile-server-secrets
+              env:
+                - name: PBF_URI
+                  value: /data/updates/latest.osc.gz
+              volumeMounts:
+                - name: update-feed
+                  mountPath: /data/updates
+                  readOnly: true
+          volumes:
+            - name: update-feed
+              persistentVolumeClaim:
+                claimName: osm-update-feed

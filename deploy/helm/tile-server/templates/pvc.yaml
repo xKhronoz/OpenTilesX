@@ -1,0 +1,11 @@
+{{- if and (eq .Values.tileStore.type "filesystem") (not .Values.tileStore.filesystem.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "tile-server.fullname" . }}-tiles
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: {{ .Values.tileStore.filesystem.size | quote }}
+{{- end }}

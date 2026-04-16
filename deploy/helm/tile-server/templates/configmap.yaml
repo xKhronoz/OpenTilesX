@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tile-server.fullname" . }}-config
+data:
+  TILE_STORE: {{ .Values.tileStore.type | quote }}
+  TILE_FS_PATH: {{ .Values.tileStore.filesystem.path | quote }}
+  MAP_BUNDLE_URI: {{ .Values.mapBundle.uri | quote }}
+  DEFAULT_LAYER: "default"
+  S3_BUCKET: {{ .Values.tileStore.s3.bucket | quote }}
+  S3_PREFIX: {{ .Values.tileStore.s3.prefix | quote }}
+  S3_REGION: {{ .Values.tileStore.s3.region | quote }}
+  S3_ENDPOINT_URL: {{ .Values.tileStore.s3.endpointUrl | quote }}
+  S3_FORCE_PATH_STYLE: {{ .Values.tileStore.s3.forcePathStyle | quote }}

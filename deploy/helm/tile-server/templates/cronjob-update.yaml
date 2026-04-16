@@ -1,0 +1,36 @@
+{{- if .Values.updates.cron.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "tile-server.fullname" . }}-update
+spec:
+  schedule: {{ .Values.updates.cron.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          securityContext:
+{{ toYaml .Values.podSecurityContext | nindent 12 }}
+          restartPolicy: OnFailure
+          containers:
+            - name: update
+              image: {{ .Values.image.adminWorker | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/run.sh", "update-once"]
+              envFrom:
+                - configMapRef:
+                    name: {{ include "tile-server.fullname" . }}-config
+                - secretRef:
+                    name: {{ include "tile-server.fullname" . }}-secrets
+              env:
+                - name: PBF_URI
+                  value: {{ .Values.updates.cron.changePath | quote }}
+              volumeMounts:
+                - name: update-feed
+                  mountPath: /data/updates
+                  readOnly: true
+          volumes:
+            - name: update-feed
+              persistentVolumeClaim:
+                claimName: {{ .Values.updates.cron.existingClaim | required "updates.cron.existingClaim is required when update cron is enabled" }}
+{{- end }}
