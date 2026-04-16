@@ -3,6 +3,8 @@
 ARG CARTO_VERSION=1.2.0
 ARG OSM_CARTO_VERSION=v5.4.0
 ARG PG_VERSION=15
+ARG POETRY_EXPORT_PLUGIN_VERSION=1.9.0
+ARG POETRY_VERSION=2.2.1
 
 FROM debian:bookworm-slim AS builder-common
 
@@ -60,6 +62,47 @@ RUN curl -fL -o NotoEmoji-Regular.ttf "https://github.com/googlefonts/noto-emoji
 
 ###########################################################################################################
 
+FROM debian:bookworm-slim AS python-deps
+
+ARG POETRY_EXPORT_PLUGIN_VERSION
+ARG POETRY_VERSION
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    VIRTUAL_ENV=/opt/tile-server-venv \
+    PATH=/opt/tile-server-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    POETRY_NO_INTERACTION=1
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        python3-pip \
+        python3-venv
+
+WORKDIR /tmp/tile-server-deps
+COPY pyproject.toml poetry.lock ./
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/pypoetry \
+    set -eux; \
+    python3 -m venv --system-site-packages "$VIRTUAL_ENV"; \
+    python3 -m venv /tmp/poetry-venv; \
+    /tmp/poetry-venv/bin/pip install \
+        "poetry==${POETRY_VERSION}" \
+        "poetry-plugin-export==${POETRY_EXPORT_PLUGIN_VERSION}"; \
+    /tmp/poetry-venv/bin/poetry export \
+        --only main \
+        --format requirements.txt \
+        --output /tmp/requirements.txt \
+        --without-hashes; \
+    "$VIRTUAL_ENV/bin/pip" install --requirement /tmp/requirements.txt; \
+    rm -rf /tmp/poetry-venv
+
+###########################################################################################################
+
 FROM debian:bookworm-slim AS runtime
 
 ARG PG_VERSION
@@ -86,7 +129,6 @@ RUN ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime \
 # belongs to deployment infrastructure.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    --mount=type=cache,target=/root/.cache/pip \
     set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -108,24 +150,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         python-is-python3 \
         python3-lxml \
         python3-mapnik \
-        python3-pip \
         python3-psycopg2 \
         python3-shapely \
-        python3-venv \
-        tini; \
-    python3 -m venv --system-site-packages "$VIRTUAL_ENV"; \
-    "$VIRTUAL_ENV/bin/pip" install \
-        boto3 \
-        osmium \
-        pyyaml \
-        requests; \
-    apt-get purge -y --auto-remove \
-        python3-pip \
-        python3-pip-whl \
-        python3-setuptools \
-        python3-setuptools-whl \
-        python3-venv \
-        python3-wheel
+        tini
 
 RUN adduser --uid 1000 --disabled-password --gecos "" renderer \
  && mkdir -p /data/tiles /data/style /data/import /data/bundles /tmp/tile-server /app \
@@ -133,6 +160,7 @@ RUN adduser --uid 1000 --disabled-password --gecos "" renderer \
 
 COPY --from=font-builder /tmp/fonts/NotoEmoji-Regular.ttf /usr/share/fonts/NotoEmoji-Regular.ttf
 COPY --from=font-builder /tmp/fonts/unifont-Medium.ttf /usr/share/fonts/unifont-Medium.ttf
+COPY --from=python-deps --chown=renderer:renderer /opt/tile-server-venv /opt/tile-server-venv
 COPY --from=compiler-helper-script --chown=renderer:renderer /home/renderer/src/regional /home/renderer/src/regional
 COPY --from=compiler-stylesheet --chown=renderer:renderer /root/openstreetmap-carto /opt/openstreetmap-carto-default
 COPY --chown=renderer:renderer tile_server /app/tile_server

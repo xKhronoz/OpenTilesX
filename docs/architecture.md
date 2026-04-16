@@ -216,6 +216,21 @@ The image exposes a role-aware `healthcheck` command:
 
 Docker images include a `HEALTHCHECK` instruction that calls `/run.sh healthcheck`.
 
+## Image And Dependency Management
+
+The Dockerfile builds one combined Debian slim runtime that is reused by all targets. Role targets only set the default role command; they do not remove packages or create role-specific dependency sets. This keeps API, renderer, admin-worker, admin-ui, and final images operationally interchangeable.
+
+Native geospatial and database packages come from Debian packages:
+
+- Mapnik and `mapnik-utils`.
+- `osm2pgsql`, `osmium-tool`, and `osmosis`.
+- PostgreSQL client tools.
+- Python bindings supplied by Debian where they depend on native libraries, including Mapnik, psycopg2, lxml, and Shapely.
+
+Python-only application dependencies are declared in `pyproject.toml` and pinned in `poetry.lock`. Poetry is a build-time tool only: the image build exports the locked main dependency set to a temporary requirements file, installs it into `/opt/tile-server-venv`, and discards Poetry before the runtime stage. The venv is created with `python3 -m venv --system-site-packages`, so Python packages installed from Poetry can coexist with Debian's native Python bindings. Poetry itself is not installed in the final runtime image.
+
+This keeps the Dockerfile focused on operating system capabilities while `pyproject.toml` is the source of truth for Python SDK/client libraries such as S3 access and HTTP/YAML helpers.
+
 ## Compatibility
 
 Legacy commands still route to the new role commands:
