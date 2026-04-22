@@ -1,6 +1,6 @@
-# openstreetmap-tile-server
+# OpenTilesX
 
-Cloud-native, airgap-capable OpenStreetMap raster tile server containers.
+Cloud-native, airgap-capable raster map tile server containers.
 
 This repository now separates the tile serving, rendering, and admin/import/update planes. PostgreSQL/PostGIS is external and authoritative. Rendered tiles can be stored on a shared filesystem or in S3-compatible object storage, including OCI Object Storage.
 
@@ -40,7 +40,7 @@ Bootstrap metadata tables once:
 ```sh
 docker run --rm \
   -e IMPORT_DATABASE_URL=postgresql://import:secret@postgres.internal:5432/gis \
-  ghcr.io/example/openstreetmap-tile-server-admin-worker:latest \
+  ghcr.io/example/opentilesx-admin-worker:latest \
   bootstrap
 ```
 
@@ -76,6 +76,34 @@ The runtime uses object API calls directly. It does not mount object storage wit
 
 Runtime imports never download a public sample PBF, style asset, font, favicon, Leaflet bundle, or replication feed implicitly. Isolated deployments must provide inputs from local paths, internal object storage, or internal HTTP mirrors.
 
+Import sources are explicit:
+
+```sh
+IMPORT_SOURCE_MODE=local
+ALLOW_INTERNAL_IMPORT_DOWNLOADS=false
+ALLOW_PUBLIC_IMPORT_DOWNLOADS=false
+EXTERNAL_DATA_MODE=auto
+ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS=false
+ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS=false
+```
+
+- `local`: mounted paths or `file://` only. This is the default and works with `/data/region.osm.pbf`, optional `/data/region.poly`, `PBF_URI`/`PBF_PATH`, and `POLY_URI`/`POLY_PATH`.
+- `internal`: internal `http(s)://`, `s3://`, or `oci://` inputs when `ALLOW_INTERNAL_IMPORT_DOWNLOADS=true`.
+- `public`: explicit public `http(s)://` inputs when `ALLOW_PUBLIC_IMPORT_DOWNLOADS=true`.
+
+The upstream `DOWNLOAD_PBF` and `DOWNLOAD_POLY` variables are accepted as explicit input URIs, but there is no silent Luxembourg fallback. Downloaded inputs are staged under `/tmp/tile-server/imports/<job-id>/` with size and SHA-256 metadata in the job result.
+
+OpenStreetMap Carto external data is explicit too:
+
+- `EXTERNAL_DATA_MODE=auto`: use vendored bundle data or a staged local preload when present, otherwise fall back to placeholder compatibility tables.
+- `EXTERNAL_DATA_MODE=local`: require vendored or preloaded offline assets and load them with `get-external-data.py` using a generated offline config.
+- `EXTERNAL_DATA_MODE=fetch`: run the upstream-style `get-external-data.py` fetch path only when the matching internal/public download policy is enabled.
+- `EXTERNAL_DATA_MODE=placeholder`: skip real external-data loading and rely on empty compatibility tables for air-gapped quick starts.
+
+Import and reimport jobs also accept `external_data_mode`, `external_data_uri`, and `external_data_source_mode`. That lets operators preload water, ice, or Natural Earth archives from a local directory, mounted archive, internal mirror, S3, or OCI object storage without reintroducing silent public downloads.
+
+If the base OSM data is already imported, you can refresh only the external-data tables with a dedicated admin job instead of rerunning `osm2pgsql`.
+
 Map-specific assets are packaged as an offline map bundle:
 
 ```sh
@@ -100,11 +128,47 @@ Validate a bundle:
 ```sh
 docker run --rm \
   -v "$PWD/examples/map-bundle:/data/bundles/default:ro" \
-  ghcr.io/example/openstreetmap-tile-server-api:latest \
+  ghcr.io/example/opentilesx-api:latest \
   validate-bundle file:///data/bundles/default
 ```
 
 HTTP bundle URLs are disabled by default. Set `ALLOW_NETWORK_FETCH=true` only when pointing at an approved internal mirror.
+
+Generate a bundle from a prepared style directory:
+
+```sh
+docker run --rm \
+  -v "$PWD/data/import:/data/import:ro" \
+  -v "$PWD/data/bundles:/data/bundles" \
+  ghcr.io/example/opentilesx-api:latest \
+  generate-bundle \
+    --style-dir /opt/openstreetmap-carto-default \
+    --output /data/bundles/malaysia-2026.04.tar.gz \
+    --name malaysia \
+    --version 2026.04 \
+    --pbf /data/import/region.osm.pbf \
+    --poly /data/import/region.poly
+```
+
+Use `--fetch-external-data` only in a connected environment with `IMPORT_SOURCE_MODE=internal` and `ALLOW_INTERNAL_IMPORT_DOWNLOADS=true`, or with the explicit public-download policy enabled. The generator copies the style, optional PBF/poly, manifest, bundled external data, and checksum file into a `.tar.gz` that can be moved into an air-gapped runtime.
+
+To vendor external data without public fetches, point the generator at a prepared local directory or archive:
+
+```sh
+docker run --rm \
+  -v "$PWD/data/preloaded-external:/data/preloaded-external:ro" \
+  -v "$PWD/data/bundles:/data/bundles" \
+  ghcr.io/example/opentilesx-api:latest \
+  generate-bundle \
+    --style-dir /opt/openstreetmap-carto-default \
+    --output /data/bundles/malaysia-offline.tar.gz \
+    --name malaysia \
+    --version 2026.04 \
+    --external-data-uri /data/preloaded-external \
+    --external-data-source-mode local
+```
+
+The bundle generator writes an `externalData` section into the manifest and creates `style/external-data.offline.yml` with `file://` URLs pointing at the vendored assets inside the bundle.
 
 ## Admin API
 
@@ -119,13 +183,40 @@ Admin mode also needs `CONTROL_DATABASE_URL` or `IMPORT_DATABASE_URL` because it
 
 When enabled, the browser control panel is available at `/admin`. It is self-contained and does not load external assets.
 
+The offline map preview is available at `/map`. It uses no Leaflet, CDN, or third-party browser library; it only requests this server's `/tile/...png` endpoints so operators can test loaded tiles in isolated environments.
+
+Render performance defaults favor cached map browsing:
+
+```sh
+WORKER_ID=render-worker-1
+IMPORT_THREADS=4
+THREADS=4
+RENDER_BACKEND=python-mapnik
+RENDER_BACKEND_URL=http://render-sidecar:9000
+RENDER_WORKER_PROCESSES=1
+METATILE_SIZE=8
+STORE_FULL_METATILE=true
+WORKER_BATCH_SIZE=32
+```
+
+`IMPORT_THREADS` is the preferred import tuning knob for `osm2pgsql`; `THREADS` remains as the backward-compatible alias. Tile rendering concurrency is separate: either run multiple renderer containers, raise `RENDER_WORKER_PROCESSES`, or both. `RENDER_BACKEND=python-mapnik` keeps rendering inside the worker process; `http-sidecar` is available for a future dedicated render service through `RENDER_BACKEND_URL`.
+
+The renderer renders one Mapnik metatile and stores every PNG in that metatile, so the first missing tile in an area is slower but nearby tiles should become available quickly. Lower `METATILE_SIZE` to reduce memory and initial latency; raise it carefully only after checking worker memory and S3/write throughput. For S3-compatible storage, write latency can dominate render time, so scaling workers only helps when PostGIS and object storage can both keep up.
+
+The Compose quick start runs two render workers by default. Add more workers only when the host CPU, PostGIS, and tile storage can keep up. Multiple workers coordinate through PostgreSQL leases plus a per-metatile advisory lock so adjacent missing tiles do not waste time rendering the same metatile twice.
+
 Create jobs:
 
 ```sh
 curl -X POST http://localhost:8080/admin/jobs/import \
   -H 'Authorization: Bearer change-me' \
   -H 'Content-Type: application/json' \
-  -d '{"pbf_uri":"/data/import/region.osm.pbf","lua":"/data/bundles/default/style/openstreetmap-carto.lua","style_file":"/data/bundles/default/style/openstreetmap-carto.style"}'
+  -d '{"pbf_uri":"/data/import/region.osm.pbf"}'
+
+curl -X POST http://localhost:8080/admin/jobs/import \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"pbf_uri":"https://mirror.internal/osm/region.osm.pbf","poly_uri":"https://mirror.internal/osm/region.poly","source_mode":"internal"}'
 
 curl -X POST http://localhost:8080/admin/jobs/reimport \
   -H 'Authorization: Bearer change-me' \
@@ -136,6 +227,14 @@ curl -X POST http://localhost:8080/admin/jobs/update \
   -H 'Authorization: Bearer change-me' \
   -H 'Content-Type: application/json' \
   -d '{"change_uri":"/data/updates/latest.osc.gz"}'
+
+curl -X POST http://localhost:8080/admin/jobs/external-data/load \
+  -H 'Authorization: Bearer change-me' \
+  -H 'Content-Type: application/json' \
+  -d '{"style_dir":"/opt/openstreetmap-carto-default","external_data_mode":"local","external_data_uri":"/data/external-data/osm-carto-cache","external_data_source_mode":"local"}'
+
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8080/admin/jobs?limit=50'
 
 curl -H 'Authorization: Bearer change-me' \
   http://localhost:8080/admin/jobs/{job-id}
@@ -156,13 +255,88 @@ Filesystem tile cache:
 docker compose up --build
 ```
 
+This starts `render-worker` and `render-worker-2` against the same external PostGIS database and shared `tile-cache` volume.
+
 S3-compatible cache using MinIO:
 
 ```sh
 docker compose -f deploy/docker-compose.s3.yml up --build
 ```
 
-Place offline import files under `./data/import` before creating import jobs.
+Airgapped local bundle plus local imports only:
+
+```sh
+docker compose -f deploy/docker-compose.airgap.yml up --build
+```
+
+Connected build that pre-bakes Carto external-data cache into the image:
+
+```sh
+docker compose -f deploy/docker-compose.external-data-build.yml build
+docker compose -f deploy/docker-compose.external-data-build.yml up
+```
+
+Compose example guide:
+
+- [docker-compose.yml](/Users/yeekit/Desktop/My%20Projects/Untitled/openstreetmap-tile-server/docker-compose.yml): local filesystem tiles, two render workers, image-bundled Carto assets.
+- [deploy/docker-compose.s3.yml](/Users/yeekit/Desktop/My%20Projects/Untitled/openstreetmap-tile-server/deploy/docker-compose.s3.yml): MinIO or other S3-compatible tile storage, two render workers.
+- [deploy/docker-compose.airgap.yml](/Users/yeekit/Desktop/My%20Projects/Untitled/openstreetmap-tile-server/deploy/docker-compose.airgap.yml): local-only imports plus mounted offline bundle for isolated environments.
+- [deploy/docker-compose.external-data-build.yml](/Users/yeekit/Desktop/My%20Projects/Untitled/openstreetmap-tile-server/deploy/docker-compose.external-data-build.yml): build images with vendored external-data cache already baked in.
+
+Place offline import files under `./data/import` before creating import jobs. The Compose examples use the image-bundled OpenStreetMap Carto import assets through `NAME_LUA`, `NAME_STYLE`, and `NAME_INDEXES`, so a local import job only needs the PBF path.
+
+The checked-in `examples/map-bundle` is a structural offline-bundle example. Its Carto import assets are placeholders, so real imports must either use the image-bundled Carto defaults or mount/activate a real bundle that contains valid `openstreetmap-carto.lua`, `openstreetmap-carto.style`, `indexes.sql`, Mapnik XML, fonts, and any external data needed by that style. The admin worker rejects placeholder bundle assets before invoking `osm2pgsql`.
+
+## External-Data Cache Prep
+
+To create a local external-data cache without touching PostGIS, run:
+
+```sh
+docker run --rm \
+  -v "$PWD/data/external-data:/data/external-data" \
+  opentilesx-final:local \
+  prepare-external-data \
+    --style-dir /opt/openstreetmap-carto-default \
+    --external-data-uri /data/external-data/osm-carto-cache \
+    --source-mode local
+```
+
+That writes vendored files into the style `data/` directory and generates `external-data.offline.yml` beside the style so later `external-data/load`, `import`, or `reimport` jobs can stay offline.
+
+The main Dockerfile can also prefetch and vendor the cache during image build:
+
+```sh
+docker build \
+  --target final \
+  -t opentilesx-final:with-external-data \
+  --build-arg PREPARE_EXTERNAL_DATA_AT_BUILD=true \
+  --build-arg FETCH_EXTERNAL_DATA_AT_BUILD=true \
+  --build-arg EXTERNAL_DATA_BUILD_SOURCE_MODE=public \
+  .
+```
+
+Useful build args:
+
+- `PREPARE_EXTERNAL_DATA_AT_BUILD=true`: run the external-data prep step during image build.
+- `FETCH_EXTERNAL_DATA_AT_BUILD=true`: actively download upstream external-data archives instead of only using an already vendored or preloaded cache.
+- `EXTERNAL_DATA_BUILD_SOURCE_MODE=public|internal|local`: apply the matching policy mode during the build.
+- `EXTERNAL_DATA_BUILD_URI=/path/or/uri`: optional preload directory or archive to vendor instead of fetching.
+- `EXTERNAL_DATA_BUILD_STYLE_DIR=/opt/openstreetmap-carto-default`: optional alternate style directory inside the image.
+
+After a successful build, `/opt/openstreetmap-carto-default/data` and `/opt/openstreetmap-carto-default/external-data.offline.yml` are already present in the image, so later `generate-bundle` runs can stay offline.
+
+You can still do the same thing in a derived image in a connected build environment:
+
+```dockerfile
+FROM opentilesx-final:local
+ENV ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS=true
+RUN /run.sh prepare-external-data \
+    --style-dir /opt/openstreetmap-carto-default \
+    --source-mode public \
+    --fetch
+```
+
+That derived image keeps the downloaded external-data archives and offline config locally, so runtime imports can use `external_data_mode=auto` or `local` without reaching the internet.
 
 ## Kubernetes and Helm
 
@@ -187,10 +361,10 @@ Containers run as UID/GID `1000`; externally provisioned PVCs and bind mounts mu
 1. Build and export role images in a connected environment:
 
    ```sh
-   docker build --target api -t osm-tile-api:airgap .
-   docker build --target renderer -t osm-tile-renderer:airgap .
-   docker build --target admin-worker -t osm-tile-admin-worker:airgap .
-   docker save osm-tile-api:airgap osm-tile-renderer:airgap osm-tile-admin-worker:airgap -o osm-tile-images.tar
+   docker build --target api -t opentilesx-api:airgap .
+   docker build --target renderer -t opentilesx-renderer:airgap .
+   docker build --target admin-worker -t opentilesx-admin-worker:airgap .
+   docker save opentilesx-api:airgap opentilesx-renderer:airgap opentilesx-admin-worker:airgap -o opentilesx-images.tar
    ```
 
 2. Assemble a local map bundle inside the isolated environment if the map cannot leave it.

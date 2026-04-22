@@ -1,7 +1,7 @@
 image:
-  api: ghcr.io/example/openstreetmap-tile-server-api:latest
-  renderer: ghcr.io/example/openstreetmap-tile-server-renderer:latest
-  adminWorker: ghcr.io/example/openstreetmap-tile-server-admin-worker:latest
+  api: ghcr.io/example/opentilesx-api:latest
+  renderer: ghcr.io/example/opentilesx-renderer:latest
+  adminWorker: ghcr.io/example/opentilesx-admin-worker:latest
   pullPolicy: IfNotPresent
 
 podSecurityContext:

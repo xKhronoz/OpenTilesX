@@ -7,11 +7,15 @@ import subprocess
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
+from .bundle_generator import generate_map_bundle
 from .bundles import MapBundleValidator, bundle_checksum
 from .config import AppConfig, mask_secret
+from .external_data import ExternalDataManager
+from .imports import ImportInputResolver
 from .tiles import TileRef
 
 
@@ -69,6 +73,25 @@ CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS hstore;
 """
 
+EXTERNAL_DATA_PLACEHOLDERS_SQL = """
+CREATE TABLE IF NOT EXISTS public.simplified_water_polygons (
+    way geometry(MultiPolygon, 3857)
+);
+CREATE TABLE IF NOT EXISTS public.water_polygons (
+    way geometry(MultiPolygon, 3857)
+);
+CREATE TABLE IF NOT EXISTS public.icesheet_polygons (
+    way geometry(MultiPolygon, 3857)
+);
+CREATE TABLE IF NOT EXISTS public.icesheet_outlines (
+    way geometry(MultiLineString, 3857),
+    ice_edge text
+);
+CREATE TABLE IF NOT EXISTS public.ne_110m_admin_0_boundary_lines_land (
+    way geometry(MultiLineString, 3857)
+);
+"""
+
 
 @dataclass(frozen=True)
 class Job:
@@ -109,6 +132,11 @@ class JobStore:
                     cur.execute(EXTENSIONS_SQL)
                 cur.execute(SCHEMA_SQL)
 
+    def ensure_external_data_placeholders(self) -> None:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(EXTERNAL_DATA_PLACEHOLDERS_SQL)
+
     @contextmanager
     def advisory_lock(self, name: str) -> Iterator[bool]:
         with self.connect() as conn:
@@ -146,6 +174,64 @@ class JobStore:
         if not row:
             return None
         return Job(str(row[0]), row[1], row[2], dict(row[3]), dict(row[4]), row[5])
+
+    def list_jobs(self, limit: int = 50, status: Optional[str] = None) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        params: list[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = %s"
+            params.append(status)
+        params.append(limit)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, kind, status, payload, result, error, attempts, created_at, updated_at, started_at, finished_at
+                    FROM tile_admin.jobs
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "id": str(row[0]),
+                "kind": row[1],
+                "status": row[2],
+                "payload": dict(row[3]),
+                "result": dict(row[4]),
+                "error": row[5],
+                "attempts": row[6],
+                "created_at": row[7].isoformat() if row[7] else None,
+                "updated_at": row[8].isoformat() if row[8] else None,
+                "started_at": row[9].isoformat() if row[9] else None,
+                "finished_at": row[10].isoformat() if row[10] else None,
+            }
+            for row in rows
+        ]
+
+    def clear_jobs(self, statuses: Iterable[str] = ("succeeded", "failed")) -> dict[str, Any]:
+        wanted = [status for status in statuses if status]
+        if not wanted:
+            return {"deleted": 0, "by_status": {}}
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM tile_admin.jobs
+                    WHERE status = ANY(%s)
+                    RETURNING status
+                    """,
+                    (wanted,),
+                )
+                rows = cur.fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[row[0]] = counts.get(row[0], 0) + 1
+        return {"deleted": len(rows), "by_status": counts}
 
     def claim_next_job(self) -> Optional[Job]:
         with self.connect() as conn:
@@ -213,7 +299,132 @@ class JobStore:
                 row = cur.fetchone()
         return dict(row[0]) if row else None
 
-    def enqueue_dirty_tile(self, tile: TileRef, reason: str = "missing") -> None:
+    def set_render_worker_heartbeat(self, worker_id: str | dict[str, Any], value: Optional[dict[str, Any]] = None) -> None:
+        if value is None:
+            value = dict(worker_id) if isinstance(worker_id, dict) else {}
+            worker_id = value.get("worker_id") or "default"
+        heartbeat = dict(value)
+        heartbeat["worker_id"] = str(worker_id)
+        self.set_setting(f"render_worker_heartbeat:{worker_id}", heartbeat)
+        self.set_setting("render_worker_heartbeat", heartbeat)
+
+    def render_worker_heartbeats(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT key, value, updated_at
+                    FROM tile_admin.settings
+                    WHERE key = 'render_worker_heartbeat'
+                       OR key LIKE 'render_worker_heartbeat:%'
+                    ORDER BY updated_at DESC
+                    """
+                )
+                rows = cur.fetchall()
+        specific = [row for row in rows if row[0] != "render_worker_heartbeat"]
+        selected = specific or rows
+        heartbeats = []
+        for key, value, updated_at in selected:
+            heartbeat = dict(value)
+            heartbeat.setdefault("worker_id", key.split(":", 1)[1] if ":" in key else "default")
+            heartbeat["setting_key"] = key
+            heartbeat["setting_updated_at"] = updated_at.isoformat() if updated_at else None
+            heartbeats.append(heartbeat)
+        return heartbeats
+
+    def dirty_tile_counts(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, count(*) FROM tile_admin.dirty_tiles GROUP BY status")
+                counts = {row[0]: row[1] for row in cur.fetchall()}
+                cur.execute(
+                    """
+                    SELECT
+                        min(created_at) FILTER (WHERE status = 'pending') AS oldest_pending,
+                        min(leased_at) FILTER (WHERE status = 'leased') AS oldest_leased
+                    FROM tile_admin.dirty_tiles
+                    """
+                )
+                row = cur.fetchone()
+        return {
+            "counts": counts,
+            "oldest_pending_at": row[0].isoformat() if row and row[0] else None,
+            "oldest_leased_at": row[1].isoformat() if row and row[1] else None,
+        }
+
+    def recent_failed_dirty_tiles(self, limit: int = 20) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, layer, z, x, y, attempts, reason, created_at, leased_at, updated_at
+                    FROM tile_admin.dirty_tiles
+                    WHERE status = 'failed'
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "layer": row[1],
+                "z": row[2],
+                "x": row[3],
+                "y": row[4],
+                "attempts": row[5],
+                "error": row[6],
+                "created_at": row[7].isoformat() if row[7] else None,
+                "leased_at": row[8].isoformat() if row[8] else None,
+                "updated_at": row[9].isoformat() if row[9] else None,
+            }
+            for row in rows
+        ]
+
+    def clear_diagnostics(
+        self,
+        dirty_statuses: Iterable[str] = ("done", "failed"),
+    ) -> dict[str, Any]:
+        statuses = [status for status in dirty_statuses if status]
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM tile_admin.settings
+                    WHERE key = 'render_worker_heartbeat'
+                       OR key LIKE 'render_worker_heartbeat:%'
+                    RETURNING key
+                    """
+                )
+                heartbeat_rows = cur.fetchall()
+                dirty_counts: dict[str, int] = {}
+                dirty_deleted = 0
+                if statuses:
+                    cur.execute(
+                        """
+                        DELETE FROM tile_admin.dirty_tiles
+                        WHERE status = ANY(%s)
+                        RETURNING status
+                        """,
+                        (statuses,),
+                    )
+                    dirty_rows = cur.fetchall()
+                    dirty_deleted = len(dirty_rows)
+                    for row in dirty_rows:
+                        dirty_counts[row[0]] = dirty_counts.get(row[0], 0) + 1
+        self.set_setting(
+            "render_worker_errors_cleared_at",
+            {"timestamp": datetime.now(timezone.utc).isoformat()},
+        )
+        return {
+            "heartbeats_deleted": len(heartbeat_rows),
+            "dirty_tiles_deleted": dirty_deleted,
+            "dirty_tiles_by_status": dirty_counts,
+        }
+
+    def enqueue_dirty_tile(self, tile: TileRef, reason: str = "missing") -> bool:
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -224,6 +435,7 @@ class JobStore:
                     """,
                     (tile.layer, tile.z, tile.x, tile.y, reason),
                 )
+                return cur.rowcount > 0
 
     def enqueue_dirty_tiles(self, tiles: Iterable[TileRef], reason: str = "manual") -> int:
         count = 0
@@ -274,6 +486,26 @@ class JobStore:
     def fail_dirty_tile(self, dirty_id: int, error: str) -> None:
         self._finish_dirty_tile(dirty_id, "failed", error)
 
+    def release_dirty_tiles(self, dirty_ids: Iterable[int], delay_seconds: float = 1.0, reason: str = "retry") -> int:
+        ids = list(dirty_ids)
+        if not ids:
+            return 0
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tile_admin.dirty_tiles
+                    SET status = 'pending',
+                        reason = %s,
+                        available_after = now() + (%s * interval '1 second'),
+                        leased_at = NULL,
+                        updated_at = now()
+                    WHERE id = ANY(%s)
+                    """,
+                    (reason, delay_seconds, ids),
+                )
+                return cur.rowcount
+
     def _finish_dirty_tile(self, dirty_id: int, status: str, error: Optional[str]) -> None:
         with self.connect() as conn:
             with conn.cursor() as cur:
@@ -308,7 +540,7 @@ class CommandBuilder:
             "-G",
             "--hstore",
             "--number-processes",
-            str(self.config.threads),
+            str(self.config.import_threads),
         ]
         command.append("--append" if append else "--create")
 
@@ -353,7 +585,7 @@ class CommandBuilder:
 
     def indexes_command(self, payload: dict[str, Any]) -> Optional[list[str]]:
         payload = self._with_bundle_defaults(payload)
-        indexes_sql = payload.get("indexes_sql")
+        indexes_sql = payload.get("indexes_sql") or os.getenv("NAME_INDEXES")
         if not indexes_sql:
             return None
         return ["psql", self.config.import_database_url or self.config.database_admin_url or "", "-f", indexes_sql]
@@ -376,6 +608,7 @@ class CommandBuilder:
 
         style = manifest.get("style") or {}
         style_dir = validation.root / style.get("directory", ".")
+        merged.setdefault("style_dir", str(style_dir))
         if not merged.get("lua") and style.get("lua"):
             merged["lua"] = str(style_dir / style["lua"])
         if not merged.get("style_file") and style.get("styleFile"):
@@ -405,6 +638,8 @@ class JobRunner:
         self.config = config
         self.store = store
         self.commands = CommandBuilder(config)
+        self.imports = ImportInputResolver(config)
+        self.external_data = ExternalDataManager(config)
 
     def run_once(self) -> bool:
         with self.store.advisory_lock("tile_admin.admin_worker") as locked:
@@ -416,13 +651,15 @@ class JobRunner:
             try:
                 result = self._run_job(job)
                 self.store.complete_job(job.id, result)
+            except CommandExecutionError as exc:
+                self.store.fail_job(job.id, str(exc), exc.result)
             except Exception as exc:
                 self.store.fail_job(job.id, str(exc))
             return True
 
     def _run_job(self, job: Job) -> dict[str, Any]:
         if job.kind == "import":
-            return self._run_import(job.payload, append=False)
+            return self._run_import(job.payload, append=False, job_id=job.id)
         if job.kind == "update":
             return self._run_update(job.payload)
         if job.kind == "reimport":
@@ -432,38 +669,65 @@ class JobRunner:
                 payload.setdefault("schema", f"osm_{uuid.uuid4().hex[:12]}")
             elif strategy != "in_place":
                 raise JobError("replace_strategy must be blue_green or in_place")
-            result = self._run_import(payload, append=False)
+            result = self._run_import(payload, append=False, job_id=job.id)
             result["replace_strategy"] = strategy
             if strategy == "blue_green":
                 self.store.set_setting("active_schema", {"schema": payload["schema"]})
             return result
         if job.kind == "expire":
             return self._run_expire(job.payload)
+        if job.kind == "external_data_load":
+            return self._run_external_data_load(job.payload, job_id=job.id)
         if job.kind == "bundle_validate":
             return self._run_bundle_validate(job.payload)
         if job.kind == "bundle_activate":
             return self._run_bundle_activate(job.payload)
+        if job.kind == "bundle_generate":
+            return self._run_bundle_generate(job.payload)
         raise JobError(f"Unknown job kind: {job.kind}")
 
-    def _run_import(self, payload: dict[str, Any], append: bool) -> dict[str, Any]:
-        command = self.commands.import_command(payload, append=append)
-        indexes_command = self.commands.indexes_command(payload)
+    def _run_import(self, payload: dict[str, Any], append: bool, job_id: str = "manual") -> dict[str, Any]:
+        payload = self.commands._with_bundle_defaults(payload)
+        resolved_payload, input_result = self.imports.resolve_payload(payload, job_id=job_id, dry_run=self.config.dry_run)
+        command = self.commands.import_command(resolved_payload, append=append)
+        indexes_command = self.commands.indexes_command(resolved_payload)
         result = {
             "command": CommandBuilder.masked(command),
             "indexes_command": CommandBuilder.masked(indexes_command) if indexes_command else None,
+            "input_resolution": input_result,
             "dry_run": self.config.dry_run,
         }
+        style_dir = self._style_dir(resolved_payload)
         if not self.config.dry_run:
-            subprocess.run(command, check=True)
+            self._validate_import_inputs(command, indexes_command)
+            result["osm2pgsql"] = self._run_command(command)
             if indexes_command:
-                subprocess.run(indexes_command, check=True)
+                result["indexes"] = self._run_command(indexes_command)
+            external_plan = self.external_data.load(
+                resolved_payload,
+                style_dir,
+                job_id=job_id,
+                dry_run=False,
+            )
+            result["external_data"] = external_plan
+            if external_plan.get("status") == "placeholder" and self.store:
+                self.store.ensure_external_data_placeholders()
+                result["external_data_placeholders"] = True
+        else:
+            result["external_data"] = self.external_data.load(
+                resolved_payload,
+                style_dir,
+                job_id=job_id,
+                dry_run=True,
+            )
         return result
 
     def _run_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         command = self.commands.update_command(payload)
         result = {"command": CommandBuilder.masked(command), "dry_run": self.config.dry_run}
         if not self.config.dry_run:
-            subprocess.run(command, check=True)
+            self._validate_import_inputs(command, None)
+            result["osm2pgsql"] = self._run_command(command)
         return result
 
     def _run_expire(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -472,6 +736,19 @@ class JobRunner:
             tiles.append(TileRef(entry.get("layer", self.config.default_layer), int(entry["z"]), int(entry["x"]), int(entry["y"])))
         count = self.store.enqueue_dirty_tiles(tiles, reason=payload.get("reason", "manual-expire"))
         return {"enqueued": count}
+
+    def _run_external_data_load(self, payload: dict[str, Any], job_id: str = "manual") -> dict[str, Any]:
+        style_dir = self._style_dir(payload)
+        result = {
+            "style_dir": str(style_dir),
+            "dry_run": self.config.dry_run,
+        }
+        plan = self.external_data.load(payload, style_dir, job_id=job_id, dry_run=self.config.dry_run)
+        result["external_data"] = plan
+        if plan.get("status") == "placeholder" and self.store:
+            self.store.ensure_external_data_placeholders()
+            result["external_data_placeholders"] = True
+        return result
 
     def _run_bundle_validate(self, payload: dict[str, Any]) -> dict[str, Any]:
         uri = payload.get("map_bundle_uri") or self.config.map_bundle_uri
@@ -497,6 +774,89 @@ class JobRunner:
         )
         return result
 
+    def _run_bundle_generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return generate_map_bundle(self.config, payload)
+
+    def _run_command(self, command: list[str]) -> dict[str, Any]:
+        completed = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = {
+            "command": CommandBuilder.masked(command),
+            "returncode": completed.returncode,
+            "stdout_tail": _tail(completed.stdout),
+            "stderr_tail": _tail(completed.stderr),
+        }
+        if completed.returncode != 0:
+            message = f"Command exited with status {completed.returncode}: {' '.join(CommandBuilder.masked(command))}"
+            if result["stderr_tail"]:
+                message = f"{message}\nstderr:\n{result['stderr_tail']}"
+            elif result["stdout_tail"]:
+                message = f"{message}\nstdout:\n{result['stdout_tail']}"
+            raise CommandExecutionError(message, result)
+        return result
+
+    def _validate_import_inputs(self, command: list[str], indexes_command: Optional[list[str]]) -> None:
+        if command:
+            self._validate_file(command[-1], "import input")
+        for flag, label in (("--tag-transform-script", "osm2pgsql Lua transform"), ("-S", "osm2pgsql style file")):
+            if flag in command:
+                index = command.index(flag)
+                if index + 1 < len(command):
+                    self._validate_file(command[index + 1], label, reject_placeholder=True)
+        if indexes_command and "-f" in indexes_command:
+            index = indexes_command.index("-f")
+            if index + 1 < len(indexes_command):
+                self._validate_file(indexes_command[index + 1], "post-import indexes SQL", reject_placeholder=True)
+
+    def _validate_file(self, path: str, label: str, reject_placeholder: bool = False) -> None:
+        file_path = Path(path)
+        if not file_path.is_file():
+            raise JobError(f"{label} does not exist or is not readable: {path}")
+        if reject_placeholder and _is_placeholder_asset(file_path):
+            raise JobError(
+                f"{label} is a placeholder file: {path}. "
+                "Replace examples/map-bundle with a real offline map bundle before running import jobs."
+            )
+
+    def _style_dir(self, payload: dict[str, Any]) -> Path:
+        if payload.get("map_bundle_uri"):
+            validation = MapBundleValidator(self.config).validate(str(payload["map_bundle_uri"]))
+            if not validation.valid or not validation.root:
+                raise JobError("; ".join(validation.errors) or "Invalid map bundle")
+            style = validation.manifest.get("style") or {}
+            style_dir = style.get("directory", ".")
+            return (validation.root / style_dir).resolve()
+        if payload.get("style_dir"):
+            return Path(str(payload["style_dir"])).resolve()
+        for key in ("lua", "style_file", "indexes_sql"):
+            value = payload.get(key)
+            if value:
+                return Path(str(value)).resolve().parent
+        if self.config.style_xml:
+            return Path(self.config.style_xml).resolve().parent
+        if Path("/data/style").is_dir():
+            return Path("/data/style").resolve()
+        return Path("/opt/openstreetmap-carto-default").resolve()
+
 
 class JobError(RuntimeError):
     pass
+
+
+class CommandExecutionError(JobError):
+    def __init__(self, message: str, result: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+def _tail(value: str, limit: int = 4000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[-limit:]
+
+
+def _is_placeholder_asset(path: Path) -> bool:
+    try:
+        sample = path.read_text(errors="ignore")[:4096]
+    except OSError:
+        return False
+    return "Placeholder for an offline map bundle" in sample or "Replace with the bundle" in sample

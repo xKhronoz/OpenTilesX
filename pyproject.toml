@@ -1,11 +1,11 @@
 [project]
-name = "openstreetmap-tile-server"
+name = "opentilesx"
 version = "0.1.0"
-description = "Cloud-native, airgap-capable OpenStreetMap raster tile server runtime"
-authors = [{ name = "OpenStreetMap tile server maintainers" }]
+description = "Cloud-native, airgap-capable raster map tile server runtime"
+authors = [{ name = "OpenTilesX maintainers" }]
 license = "BSD-2-Clause"
 readme = "README.md"
-requires-python = ">=3.11,<4.0"
+requires-python = ">=3.13,<4.0"
 dependencies = [
     "boto3>=1.34,<2.0",
     "osmium>=3.7,<5.0",

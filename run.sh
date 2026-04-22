@@ -17,7 +17,7 @@ case "$1" in
         shift
         exec python3 -m tile_server.cli import-once "$@"
         ;;
-    tile-api|render-worker|admin-worker|bootstrap|import-once|update-once|validate-bundle|healthcheck)
+    tile-api|render-worker|admin-worker|bootstrap|import-once|update-once|validate-bundle|generate-bundle|prepare-external-data|healthcheck)
         exec python3 -m tile_server.cli "$@"
         ;;
     *)

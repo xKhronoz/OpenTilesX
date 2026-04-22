@@ -1,8 +1,11 @@
-.PHONY: build build-api build-renderer build-admin test compose-up compose-down
+.PHONY: build build-frontend build-api build-renderer build-admin test compose-up compose-down
 
-DOCKER_IMAGE ?= openstreetmap-tile-server
+DOCKER_IMAGE ?= opentilesx
 
-build: build-api build-renderer build-admin
+build: build-frontend build-api build-renderer build-admin
+
+build-frontend:
+	npm run build:app
 
 build-api:
 	docker build --target api -t $(DOCKER_IMAGE)-api .
@@ -17,7 +20,7 @@ test:
 	python3 -m unittest discover -s tests
 
 compose-up:
-	docker compose up --build
+	docker compose up -d --build
 
 compose-down:
 	docker compose down --volumes --remove-orphans

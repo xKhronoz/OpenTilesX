@@ -17,6 +17,8 @@
 /htmlcov/
 /.mypy_cache/
 /.ruff_cache/
+/node_modules/
+/frontend/**/node_modules/
 .DS_Store
 *.log
 *.mbtiles

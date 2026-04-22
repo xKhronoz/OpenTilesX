@@ -1,0 +1,132 @@
+services:
+  postgis:
+    image: postgis/postgis:15-3.4
+    command:
+      - postgres
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - checkpoint_completion_target=0.9
+    environment:
+      POSTGRES_DB: gis
+      POSTGRES_USER: osm
+      POSTGRES_PASSWORD: osm
+    volumes:
+      - postgis-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osm -d gis"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  bootstrap:
+    build:
+      context: ..
+      target: admin-worker
+    command: bootstrap
+    environment:
+      IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      DATABASE_ADMIN_URL: postgresql://osm:osm@postgis:5432/gis
+      IMPORT_SOURCE_MODE: local
+      EXTERNAL_DATA_MODE: local
+      ALLOW_INTERNAL_IMPORT_DOWNLOADS: "false"
+      ALLOW_PUBLIC_IMPORT_DOWNLOADS: "false"
+      ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS: "false"
+      ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS: "false"
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+  tile-api:
+    build:
+      context: ..
+      target: api
+    environment:
+      RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      TILE_STORE: filesystem
+      TILE_FS_PATH: /data/tiles
+      MAP_BUNDLE_URI: file:///data/bundles/default
+      IMPORT_SOURCE_MODE: local
+      EXTERNAL_DATA_MODE: local
+      ALLOW_INTERNAL_IMPORT_DOWNLOADS: "false"
+      ALLOW_PUBLIC_IMPORT_DOWNLOADS: "false"
+      ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS: "false"
+      ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS: "false"
+      ADMIN_ENABLED: "true"
+      ADMIN_TOKEN: change-me
+    volumes:
+      - tile-cache:/data/tiles
+      - ../data/bundles/default:/data/bundles/default:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  render-worker:
+    build:
+      context: ..
+      target: renderer
+    environment: &airgap-renderer-env
+      RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      TILE_STORE: filesystem
+      TILE_FS_PATH: /data/tiles
+      MAP_BUNDLE_URI: file:///data/bundles/default
+      IMPORT_SOURCE_MODE: local
+      EXTERNAL_DATA_MODE: local
+      ALLOW_INTERNAL_IMPORT_DOWNLOADS: "false"
+      ALLOW_PUBLIC_IMPORT_DOWNLOADS: "false"
+      ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS: "false"
+      ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS: "false"
+      WORKER_ID: render-worker-1
+    volumes:
+      - tile-cache:/data/tiles
+      - ../data/bundles/default:/data/bundles/default:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  render-worker-2:
+    build:
+      context: ..
+      target: renderer
+    environment:
+      <<: *airgap-renderer-env
+      WORKER_ID: render-worker-2
+    volumes:
+      - tile-cache:/data/tiles
+      - ../data/bundles/default:/data/bundles/default:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  admin-worker:
+    build:
+      context: ..
+      target: admin-worker
+    environment:
+      IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+      TILE_STORE: filesystem
+      TILE_FS_PATH: /data/tiles
+      MAP_BUNDLE_URI: file:///data/bundles/default
+      IMPORT_SOURCE_MODE: local
+      EXTERNAL_DATA_MODE: local
+      ALLOW_INTERNAL_IMPORT_DOWNLOADS: "false"
+      ALLOW_PUBLIC_IMPORT_DOWNLOADS: "false"
+      ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS: "false"
+      ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS: "false"
+    volumes:
+      - tile-cache:/data/tiles
+      - ../data/import:/data/import:ro
+      - ../data/bundles/default:/data/bundles/default:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+volumes:
+  postgis-data:
+  tile-cache:

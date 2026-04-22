@@ -41,6 +41,39 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 AppConfig.from_env("tile-api")
 
+    def test_metatile_size_is_configurable(self):
+        env = {
+            "RENDER_DATABASE_URL": "postgresql://render:secret@postgres/gis",
+            "WORKER_ID": "renderer-a",
+            "METATILE_SIZE": "4",
+            "STORE_FULL_METATILE": "false",
+            "IMPORT_THREADS": "6",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = AppConfig.from_env("render-worker")
+        self.assertEqual(config.worker_id, "renderer-a")
+        self.assertEqual(config.metatile_size, 4)
+        self.assertFalse(config.store_full_metatile)
+        self.assertEqual(config.import_threads, 6)
+
+    def test_metatile_size_rejects_unsafe_values(self):
+        env = {
+            "RENDER_DATABASE_URL": "postgresql://render:secret@postgres/gis",
+            "METATILE_SIZE": "32",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ConfigError):
+                AppConfig.from_env("render-worker")
+
+    def test_http_sidecar_backend_requires_url(self):
+        env = {
+            "RENDER_DATABASE_URL": "postgresql://render:secret@postgres/gis",
+            "RENDER_BACKEND": "http-sidecar",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ConfigError):
+                AppConfig.from_env("render-worker")
+
 
 if __name__ == "__main__":
     unittest.main()

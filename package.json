@@ -1,0 +1,15 @@
+{
+  "name": "opentilesx-web-ui",
+  "private": true,
+  "scripts": {
+    "build:app": "vite build --config frontend/app/vite.config.js"
+  },
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "vite": "^8.0.9"
+  }
+}

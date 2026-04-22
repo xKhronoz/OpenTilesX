@@ -176,6 +176,27 @@ class MapBundleValidator:
             if value and not (root / style_dir / value).is_file():
                 result.errors.append(f"style.{key} does not exist: {style_dir}/{value}")
 
+        external_data = root / style_dir / "external-data.yml"
+        external_data_offline = root / style_dir / "external-data.offline.yml"
+        external_data_dir = root / style_dir / "data"
+        manifest_external = manifest.get("externalData") or {}
+        if manifest_external and not isinstance(manifest_external, dict):
+            result.errors.append("externalData must be an object when present")
+        if isinstance(manifest_external, dict):
+            offline_config = manifest_external.get("offline_config")
+            if offline_config and not (root / offline_config).is_file():
+                result.errors.append(f"externalData.offline_config does not exist: {offline_config}")
+            data_dir_value = manifest_external.get("data_dir")
+            if data_dir_value and not (root / data_dir_value).is_dir():
+                result.errors.append(f"externalData.data_dir does not exist: {data_dir_value}")
+        if external_data.is_file() and not external_data_offline.is_file() and (
+            not external_data_dir.is_dir() or not any(external_data_dir.iterdir())
+        ):
+            result.warnings.append(
+                "style/external-data.yml exists but bundled external data was not found; "
+                "generate the bundle with external data before airgap import/rendering."
+            )
+
         for layer in manifest.get("layers", [{"name": "default"}]):
             if not isinstance(layer, dict) or not layer.get("name"):
                 result.errors.append("Each layer entry must be an object with a name")

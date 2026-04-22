@@ -54,8 +54,24 @@ class AppConfig:
     listen_port: int
     worker_poll_interval: float
     worker_batch_size: int
+    worker_id: Optional[str]
+    metatile_size: int
+    store_full_metatile: bool
     threads: int
+    import_threads: int
+    render_worker_processes: int
+    render_backend: str
+    render_backend_url: Optional[str]
     osm2pgsql_extra_args: str
+    import_source_mode: str
+    allow_internal_import_downloads: bool
+    allow_public_import_downloads: bool
+    import_staging_path: str
+    external_data_mode: str
+    allow_internal_external_data_downloads: bool
+    allow_public_external_data_downloads: bool
+    external_data_staging_path: str
+    bundle_output_dir: str
     allow_network_fetch: bool
     dry_run: bool
 
@@ -98,8 +114,24 @@ class AppConfig:
             listen_port=env_int("LISTEN_PORT", 8080),
             worker_poll_interval=float(os.getenv("WORKER_POLL_INTERVAL", "5")),
             worker_batch_size=env_int("WORKER_BATCH_SIZE", 32),
+            worker_id=os.getenv("WORKER_ID") or None,
+            metatile_size=env_int("METATILE_SIZE", 8),
+            store_full_metatile=env_bool("STORE_FULL_METATILE", True),
             threads=env_int("THREADS", 4),
+            import_threads=env_int("IMPORT_THREADS", env_int("THREADS", 4)),
+            render_worker_processes=env_int("RENDER_WORKER_PROCESSES", 1),
+            render_backend=os.getenv("RENDER_BACKEND", "python-mapnik").strip().lower(),
+            render_backend_url=os.getenv("RENDER_BACKEND_URL"),
             osm2pgsql_extra_args=os.getenv("OSM2PGSQL_EXTRA_ARGS", ""),
+            import_source_mode=os.getenv("IMPORT_SOURCE_MODE", "local").strip().lower(),
+            allow_internal_import_downloads=env_bool("ALLOW_INTERNAL_IMPORT_DOWNLOADS", False),
+            allow_public_import_downloads=env_bool("ALLOW_PUBLIC_IMPORT_DOWNLOADS", False),
+            import_staging_path=os.getenv("IMPORT_STAGING_PATH", "/tmp/tile-server/imports"),
+            external_data_mode=os.getenv("EXTERNAL_DATA_MODE", "auto").strip().lower(),
+            allow_internal_external_data_downloads=env_bool("ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS", False),
+            allow_public_external_data_downloads=env_bool("ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS", False),
+            external_data_staging_path=os.getenv("EXTERNAL_DATA_STAGING_PATH", "/tmp/tile-server/external-data"),
+            bundle_output_dir=os.getenv("MAP_BUNDLE_OUTPUT_DIR", "/data/bundles/generated"),
             allow_network_fetch=env_bool("ALLOW_NETWORK_FETCH", False),
             dry_run=env_bool("DRY_RUN", False),
         )
@@ -109,6 +141,12 @@ class AppConfig:
     def validate(self) -> None:
         if self.tile_store not in {"filesystem", "s3"}:
             raise ConfigError("TILE_STORE must be either 'filesystem' or 's3'")
+        if self.import_source_mode not in {"local", "internal", "public"}:
+            raise ConfigError("IMPORT_SOURCE_MODE must be one of local, internal, public")
+        if self.external_data_mode not in {"auto", "local", "fetch", "placeholder"}:
+            raise ConfigError("EXTERNAL_DATA_MODE must be one of auto, local, fetch, placeholder")
+        if self.render_backend not in {"python-mapnik", "http-sidecar"}:
+            raise ConfigError("RENDER_BACKEND must be one of python-mapnik, http-sidecar")
 
         if self.tile_store == "s3":
             if not self.s3 or not self.s3.bucket:
@@ -128,6 +166,14 @@ class AppConfig:
 
         if self.role in {"tile-api", "render-worker", "admin-worker"} and not self.job_database_url:
             raise ConfigError(f"A metadata database URL is required for {self.role}")
+        if self.metatile_size < 1 or self.metatile_size > 16:
+            raise ConfigError("METATILE_SIZE must be between 1 and 16")
+        if self.import_threads < 1:
+            raise ConfigError("IMPORT_THREADS must be at least 1")
+        if self.render_worker_processes < 1:
+            raise ConfigError("RENDER_WORKER_PROCESSES must be at least 1")
+        if self.render_backend == "http-sidecar" and self.role == "render-worker" and not self.render_backend_url:
+            raise ConfigError("RENDER_BACKEND_URL is required when RENDER_BACKEND=http-sidecar")
 
 
 class ConfigError(RuntimeError):

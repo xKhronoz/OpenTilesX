@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: osm-tile-server-config
+  name: opentilesx-config
 data:
   TILE_STORE: filesystem
   TILE_FS_PATH: /data/tiles
@@ -11,7 +11,7 @@ data:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: osm-tile-server-secrets
+  name: opentilesx-secrets
 type: Opaque
 stringData:
   RENDER_DATABASE_URL: postgresql://render:change-me@postgres.example.internal:5432/gis
@@ -32,7 +32,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: osm-tile-cache
+  name: opentilesx-tile-cache
 spec:
   accessModes: ["ReadWriteMany"]
   resources:
@@ -42,10 +42,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: osm-tile-api
+  name: opentilesx-api
 spec:
   selector:
-    app: osm-tile-api
+    app: opentilesx-api
   ports:
     - name: http
       port: 80
@@ -54,16 +54,16 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: osm-tile-api
+  name: opentilesx-api
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: osm-tile-api
+      app: opentilesx-api
   template:
     metadata:
       labels:
-        app: osm-tile-api
+        app: opentilesx-api
     spec:
       securityContext:
         runAsNonRoot: true
@@ -72,12 +72,12 @@ spec:
         fsGroup: 1000
       containers:
         - name: api
-          image: ghcr.io/example/openstreetmap-tile-server-api:latest
+          image: ghcr.io/example/opentilesx-api:latest
           envFrom:
             - configMapRef:
-                name: osm-tile-server-config
+                name: opentilesx-config
             - secretRef:
-                name: osm-tile-server-secrets
+                name: opentilesx-secrets
           env:
             - name: ADMIN_ENABLED
               value: "true"
@@ -96,7 +96,7 @@ spec:
       volumes:
         - name: tile-cache
           persistentVolumeClaim:
-            claimName: osm-tile-cache
+            claimName: opentilesx-tile-cache
         - name: map-bundle
           persistentVolumeClaim:
             claimName: osm-map-bundle
@@ -122,12 +122,12 @@ spec:
         fsGroup: 1000
       containers:
         - name: renderer
-          image: ghcr.io/example/openstreetmap-tile-server-renderer:latest
+          image: ghcr.io/example/opentilesx-renderer:latest
           envFrom:
             - configMapRef:
-                name: osm-tile-server-config
+                name: opentilesx-config
             - secretRef:
-                name: osm-tile-server-secrets
+                name: opentilesx-secrets
           volumeMounts:
             - name: tile-cache
               mountPath: /data/tiles
@@ -137,7 +137,7 @@ spec:
       volumes:
         - name: tile-cache
           persistentVolumeClaim:
-            claimName: osm-tile-cache
+            claimName: opentilesx-tile-cache
         - name: map-bundle
           persistentVolumeClaim:
             claimName: osm-map-bundle
@@ -163,12 +163,12 @@ spec:
         fsGroup: 1000
       containers:
         - name: admin-worker
-          image: ghcr.io/example/openstreetmap-tile-server-admin-worker:latest
+          image: ghcr.io/example/opentilesx-admin-worker:latest
           envFrom:
             - configMapRef:
-                name: osm-tile-server-config
+                name: opentilesx-config
             - secretRef:
-                name: osm-tile-server-secrets
+                name: opentilesx-secrets
           volumeMounts:
             - name: import-data
               mountPath: /data/import
@@ -184,7 +184,7 @@ spec:
             claimName: osm-import-data
         - name: tile-cache
           persistentVolumeClaim:
-            claimName: osm-tile-cache
+            claimName: opentilesx-tile-cache
         - name: map-bundle
           persistentVolumeClaim:
             claimName: osm-map-bundle
@@ -208,13 +208,13 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: enqueue-update
-              image: ghcr.io/example/openstreetmap-tile-server-admin-worker:latest
+              image: ghcr.io/example/opentilesx-admin-worker:latest
               command: ["/run.sh", "update-once"]
               envFrom:
                 - configMapRef:
-                    name: osm-tile-server-config
+                    name: opentilesx-config
                 - secretRef:
-                    name: osm-tile-server-secrets
+                    name: opentilesx-secrets
               env:
                 - name: PBF_URI
                   value: /data/updates/latest.osc.gz

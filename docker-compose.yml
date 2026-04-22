@@ -1,8 +1,36 @@
-version: "3.8"
+x-render-worker-common: &render-worker-common
+  build:
+    context: .
+    target: renderer
+  environment: &render-worker-env
+    RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+    CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+    TILE_STORE: filesystem
+    TILE_FS_PATH: /data/tiles
+    RENDER_BACKEND: python-mapnik
+    RENDER_WORKER_PROCESSES: "4"
+    METATILE_SIZE: "8"
+    STORE_FULL_METATILE: "true"
+    WORKER_BATCH_SIZE: "32"
+  volumes:
+    - tile-cache:/data/tiles
+  depends_on:
+    bootstrap:
+      condition: service_completed_successfully
 
 services:
   postgis:
+    container_name: postgis
     image: postgis/postgis:15-3.4
+    platform: linux/amd64
+    command:
+      - postgres
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - checkpoint_completion_target=0.9
     environment:
       POSTGRES_DB: gis
       POSTGRES_USER: osm
@@ -16,6 +44,7 @@ services:
       retries: 10
 
   bootstrap:
+    container_name: bootstrap
     build:
       context: .
       target: admin-worker
@@ -23,11 +52,16 @@ services:
     environment:
       IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
       DATABASE_ADMIN_URL: postgresql://osm:osm@postgis:5432/gis
+      IMPORT_THREADS: "4"
+      EXTERNAL_DATA_MODE: auto
+      ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS: "false"
+      ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS: "false"
     depends_on:
       postgis:
         condition: service_healthy
 
   tile-api:
+    container_name: tile-api
     build:
       context: .
       target: api
@@ -36,12 +70,12 @@ services:
       CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
       TILE_STORE: filesystem
       TILE_FS_PATH: /data/tiles
-      MAP_BUNDLE_URI: file:///data/bundles/default
+      RENDER_BACKEND: python-mapnik
+      RENDER_WORKER_PROCESSES: "4"
       ADMIN_ENABLED: "true"
       ADMIN_TOKEN: change-me
     volumes:
       - tile-cache:/data/tiles
-      - ./examples/map-bundle:/data/bundles/default:ro
     ports:
       - "8080:8080"
     depends_on:
@@ -49,23 +83,21 @@ services:
         condition: service_completed_successfully
 
   render-worker:
-    build:
-      context: .
-      target: renderer
+    container_name: render-worker-1
+    <<: *render-worker-common
     environment:
-      RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
-      CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
-      TILE_STORE: filesystem
-      TILE_FS_PATH: /data/tiles
-      MAP_BUNDLE_URI: file:///data/bundles/default
-    volumes:
-      - tile-cache:/data/tiles
-      - ./examples/map-bundle:/data/bundles/default:ro
-    depends_on:
-      bootstrap:
-        condition: service_completed_successfully
+      <<: *render-worker-env
+      WORKER_ID: render-worker-1
+
+  render-worker-2:
+    container_name: render-worker-2
+    <<: *render-worker-common
+    environment:
+      <<: *render-worker-env
+      WORKER_ID: render-worker-2
 
   admin-worker:
+    container_name: admin-worker
     build:
       context: .
       target: admin-worker
@@ -73,11 +105,16 @@ services:
       IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
       TILE_STORE: filesystem
       TILE_FS_PATH: /data/tiles
-      MAP_BUNDLE_URI: file:///data/bundles/default
+      IMPORT_THREADS: "4"
+      EXTERNAL_DATA_MODE: auto
+      ALLOW_INTERNAL_EXTERNAL_DATA_DOWNLOADS: "false"
+      ALLOW_PUBLIC_EXTERNAL_DATA_DOWNLOADS: "false"
+      NAME_LUA: /opt/openstreetmap-carto-default/openstreetmap-carto.lua
+      NAME_STYLE: /opt/openstreetmap-carto-default/openstreetmap-carto.style
+      NAME_INDEXES: /opt/openstreetmap-carto-default/indexes.sql
     volumes:
       - tile-cache:/data/tiles
       - ./data/import:/data/import:ro
-      - ./examples/map-bundle:/data/bundles/default:ro
     depends_on:
       bootstrap:
         condition: service_completed_successfully

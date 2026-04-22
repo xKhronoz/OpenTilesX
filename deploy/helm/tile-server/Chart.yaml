@@ -1,6 +1,6 @@
 apiVersion: v2
-name: tile-server
-description: Cloud-native, airgap-capable OpenStreetMap tile server roles
+name: opentilesx
+description: Cloud-native, airgap-capable OpenTilesX tile server roles
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

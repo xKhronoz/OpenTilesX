@@ -1,8 +1,42 @@
-version: "3.8"
+x-render-worker-common: &render-worker-common
+  build:
+    context: ..
+    target: renderer
+  environment: &render-worker-env
+    RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+    CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
+    TILE_STORE: s3
+    S3_BUCKET: tiles
+    S3_PREFIX: osm
+    S3_REGION: us-east-1
+    S3_ENDPOINT_URL: http://minio:9000
+    AWS_ACCESS_KEY_ID: minio
+    AWS_SECRET_ACCESS_KEY: minio123
+    S3_FORCE_PATH_STYLE: "true"
+    RENDER_BACKEND: python-mapnik
+    RENDER_WORKER_PROCESSES: "1"
+    METATILE_SIZE: "8"
+    STORE_FULL_METATILE: "true"
+    WORKER_BATCH_SIZE: "32"
+  depends_on:
+    bootstrap:
+      condition: service_completed_successfully
+    minio:
+      condition: service_started
+    create-bucket:
+      condition: service_completed_successfully
 
 services:
   postgis:
     image: postgis/postgis:15-3.4
+    command:
+      - postgres
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - checkpoint_completion_target=0.9
     environment:
       POSTGRES_DB: gis
       POSTGRES_USER: osm
@@ -45,6 +79,8 @@ services:
     environment:
       IMPORT_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
       DATABASE_ADMIN_URL: postgresql://osm:osm@postgis:5432/gis
+      IMPORT_THREADS: "4"
+      EXTERNAL_DATA_MODE: auto
     depends_on:
       postgis:
         condition: service_healthy
@@ -64,11 +100,10 @@ services:
       AWS_ACCESS_KEY_ID: minio
       AWS_SECRET_ACCESS_KEY: minio123
       S3_FORCE_PATH_STYLE: "true"
-      MAP_BUNDLE_URI: file:///data/bundles/default
+      RENDER_BACKEND: python-mapnik
+      RENDER_WORKER_PROCESSES: "1"
       ADMIN_ENABLED: "true"
       ADMIN_TOKEN: change-me
-    volumes:
-      - ../examples/map-bundle:/data/bundles/default:ro
     ports:
       - "8080:8080"
     depends_on:
@@ -80,30 +115,18 @@ services:
         condition: service_completed_successfully
 
   render-worker:
-    build:
-      context: ..
-      target: renderer
+    container_name: render-worker-1
+    <<: *render-worker-common
     environment:
-      RENDER_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
-      CONTROL_DATABASE_URL: postgresql://osm:osm@postgis:5432/gis
-      TILE_STORE: s3
-      S3_BUCKET: tiles
-      S3_PREFIX: osm
-      S3_REGION: us-east-1
-      S3_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio123
-      S3_FORCE_PATH_STYLE: "true"
-      MAP_BUNDLE_URI: file:///data/bundles/default
-    volumes:
-      - ../examples/map-bundle:/data/bundles/default:ro
-    depends_on:
-      bootstrap:
-        condition: service_completed_successfully
-      minio:
-        condition: service_started
-      create-bucket:
-        condition: service_completed_successfully
+      <<: *render-worker-env
+      WORKER_ID: render-worker-1
+
+  render-worker-2:
+    container_name: render-worker-2
+    <<: *render-worker-common
+    environment:
+      <<: *render-worker-env
+      WORKER_ID: render-worker-2
 
   admin-worker:
     build:
@@ -119,10 +142,13 @@ services:
       AWS_ACCESS_KEY_ID: minio
       AWS_SECRET_ACCESS_KEY: minio123
       S3_FORCE_PATH_STYLE: "true"
-      MAP_BUNDLE_URI: file:///data/bundles/default
+      IMPORT_THREADS: "4"
+      EXTERNAL_DATA_MODE: auto
+      NAME_LUA: /opt/openstreetmap-carto-default/openstreetmap-carto.lua
+      NAME_STYLE: /opt/openstreetmap-carto-default/openstreetmap-carto.style
+      NAME_INDEXES: /opt/openstreetmap-carto-default/indexes.sql
     volumes:
       - ../data/import:/data/import:ro
-      - ../examples/map-bundle:/data/bundles/default:ro
     depends_on:
       bootstrap:
         condition: service_completed_successfully

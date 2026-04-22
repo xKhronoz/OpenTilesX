@@ -1,4 +1,4 @@
-"""Cloud-native OpenStreetMap tile server runtime."""
+"""OpenTilesX cloud-native raster tile server runtime."""
 
 __all__ = ["__version__"]
 
