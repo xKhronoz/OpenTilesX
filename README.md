@@ -2,7 +2,9 @@
 
 Cloud-native, airgap-capable raster map tile server containers.
 
-This repository now separates the tile serving, rendering, and admin/import/update planes. PostgreSQL/PostGIS is external and authoritative. Rendered tiles can be stored on a shared filesystem or in S3-compatible object storage, including OCI Object Storage.
+Inspired by the original openstreetmap-tile-server, this project rearchitects the tile server into separate role-based containers for API, rendering, and admin planes. It uses external PostgreSQL/PostGIS as the authoritative data source and supports both filesystem and S3-compatible tile storage. The design also emphasizes airgap operation with explicit import sources and offline map bundles.
+
+This repository separates the tile serving, rendering, and admin/import/update planes. PostgreSQL/PostGIS is external and authoritative. Rendered tiles can be stored on a shared filesystem or in S3-compatible object storage, including OCI Object Storage.
 
 ## Architecture
 
@@ -194,16 +196,23 @@ THREADS=4
 RENDER_BACKEND=python-mapnik
 RENDER_BACKEND_URL=http://render-sidecar:9000
 RENDER_WORKER_PROCESSES=1
+RENDER_DB_MAX_ACTIVE=2
+RENDER_DB_STATEMENT_TIMEOUT_MS=30000
 METATILE_SIZE=8
 STORE_FULL_METATILE=true
-WORKER_BATCH_SIZE=32
+NEARBY_PREFETCH_ENABLED=true
+NEARBY_PREFETCH_RADIUS=1
+NEARBY_PREFETCH_PRIORITY=250
+WORKER_BATCH_SIZE=8
 ```
 
-`IMPORT_THREADS` is the preferred import tuning knob for `osm2pgsql`; `THREADS` remains as the backward-compatible alias. Tile rendering concurrency is separate: either run multiple renderer containers, raise `RENDER_WORKER_PROCESSES`, or both. `RENDER_BACKEND=python-mapnik` keeps rendering inside the worker process; `http-sidecar` is available for a future dedicated render service through `RENDER_BACKEND_URL`.
+`IMPORT_THREADS` is the preferred import tuning knob for `osm2pgsql`; `THREADS` remains as the backward-compatible alias. Tile rendering concurrency is separate from import concurrency. Start with multiple renderer containers and `RENDER_WORKER_PROCESSES=1` before raising per-container worker counts. `RENDER_DB_MAX_ACTIVE` is the hard safety cap for how many metatile renders may hit PostGIS at once across the worker fleet, and `RENDER_DB_STATEMENT_TIMEOUT_MS` injects a statement timeout plus read-only session options into Mapnik PostGIS datasource connections. `RENDER_BACKEND=python-mapnik` keeps rendering inside the worker process; `http-sidecar` is available for a future dedicated render service through `RENDER_BACKEND_URL`.
 
-The renderer renders one Mapnik metatile and stores every PNG in that metatile, so the first missing tile in an area is slower but nearby tiles should become available quickly. Lower `METATILE_SIZE` to reduce memory and initial latency; raise it carefully only after checking worker memory and S3/write throughput. For S3-compatible storage, write latency can dominate render time, so scaling workers only helps when PostGIS and object storage can both keep up.
+The renderer queues work per metatile, not per tile, so repeated misses within the same area are coalesced before rendering. One Mapnik metatile render can store every PNG in that metatile, which makes the first missing tile in an area slower but warms nearby tiles quickly. Lower `METATILE_SIZE` to reduce memory and initial latency; raise it carefully only after checking worker memory and S3/write throughput. For interactive browsing, the local `docker-compose.yml` quick start sets `METATILE_SIZE=4` so the first uncached tile waits on a smaller render. For S3-compatible storage, write latency can dominate render time, so scaling workers only helps when PostGIS and object storage can both keep up.
 
-The Compose quick start runs two render workers by default. Add more workers only when the host CPU, PostGIS, and tile storage can keep up. Multiple workers coordinate through PostgreSQL leases plus a per-metatile advisory lock so adjacent missing tiles do not waste time rendering the same metatile twice.
+When `NEARBY_PREFETCH_ENABLED=true`, the API only fans out nearby work when a metatile miss is first seen. It queues the four orthogonal neighboring metatiles as lower-priority `nearby-prefetch` jobs, so direct misses still outrank speculative warm-up. `NEARBY_PREFETCH_RADIUS` expands that ring by additional orthogonal steps, and `NEARBY_PREFETCH_PRIORITY` controls the queue priority for that prefetch work.
+
+The Compose quick start runs two render workers by default and keeps the cluster-wide PostGIS render cap at `RENDER_DB_MAX_ACTIVE=2`. It also uses the smaller 4x4 metatile preset with nearby ring prefetch enabled to improve first-tile responsiveness while still warming adjacent cache. Add more workers only when the host CPU, PostGIS, and tile storage can keep up, and do not raise `RENDER_DB_MAX_ACTIVE` until queue age and render latency stay healthy under load. Multiple workers coordinate through PostgreSQL leases, a render-slot advisory lock pool, and a per-metatile advisory lock so adjacent missing tiles do not waste time rendering the same metatile twice.
 
 Create jobs:
 
@@ -386,3 +395,7 @@ make build
 ```
 
 The CI workflow builds `api`, `renderer`, `admin-worker`, and `admin-ui` targets for amd64 and arm64.
+
+## Credits
+
+- [openstreetmap-tile-server](https://github.com/Overv/openstreetmap-tile-server) for the original open-source tile server and ecosystem that inspired this project.

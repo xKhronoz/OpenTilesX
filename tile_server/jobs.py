@@ -16,7 +16,7 @@ from .bundles import MapBundleValidator, bundle_checksum
 from .config import AppConfig, mask_secret
 from .external_data import ExternalDataManager
 from .imports import ImportInputResolver
-from .tiles import TileRef
+from .tiles import TileRef, metatile_origin
 
 
 SCHEMA_SQL = """
@@ -54,11 +54,27 @@ CREATE TABLE IF NOT EXISTS tile_admin.dirty_tiles (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS dirty_tiles_status_idx
-ON tile_admin.dirty_tiles (status, available_after, created_at);
+ALTER TABLE tile_admin.dirty_tiles
+    ADD COLUMN IF NOT EXISTS origin_x integer,
+    ADD COLUMN IF NOT EXISTS origin_y integer,
+    ADD COLUMN IF NOT EXISTS metatile_size integer NOT NULL DEFAULT 8,
+    ADD COLUMN IF NOT EXISTS priority integer NOT NULL DEFAULT 100,
+    ADD COLUMN IF NOT EXISTS request_count integer NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS requested_at timestamptz NOT NULL DEFAULT now();
 
-CREATE UNIQUE INDEX IF NOT EXISTS dirty_tiles_active_unique_idx
-ON tile_admin.dirty_tiles (layer, z, x, y)
+UPDATE tile_admin.dirty_tiles
+SET origin_x = COALESCE(origin_x, (x / GREATEST(metatile_size, 1)) * GREATEST(metatile_size, 1)),
+    origin_y = COALESCE(origin_y, (y / GREATEST(metatile_size, 1)) * GREATEST(metatile_size, 1)),
+    requested_at = COALESCE(requested_at, created_at)
+WHERE origin_x IS NULL OR origin_y IS NULL OR requested_at IS NULL;
+
+DROP INDEX IF EXISTS tile_admin.dirty_tiles_active_unique_idx;
+DROP INDEX IF EXISTS dirty_tiles_active_unique_idx;
+CREATE INDEX IF NOT EXISTS dirty_tiles_status_idx
+ON tile_admin.dirty_tiles (status, priority DESC, available_after, requested_at, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS dirty_tiles_active_metatile_unique_idx
+ON tile_admin.dirty_tiles (layer, z, origin_x, origin_y, metatile_size)
 WHERE status IN ('pending', 'leased');
 
 CREATE TABLE IF NOT EXISTS tile_admin.settings (
@@ -101,6 +117,59 @@ class Job:
     payload: dict[str, Any]
     result: dict[str, Any]
     error: Optional[str]
+
+
+@dataclass(frozen=True)
+class DirtyTileJob:
+    id: int
+    tile: TileRef
+    origin: TileRef
+    metatile_size: int
+    priority: int
+    request_count: int
+    requested_at: Optional[datetime]
+    reason: str
+    attempts: int
+
+
+@dataclass(frozen=True)
+class DirtyTileEnqueueResult:
+    status: str
+    dirty_id: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"created", "coalesced", "ignored"}:
+            raise ValueError(f"Unsupported enqueue status: {self.status}")
+
+    @property
+    def created(self) -> bool:
+        return self.status == "created"
+
+    @property
+    def coalesced(self) -> bool:
+        return self.status == "coalesced"
+
+    @property
+    def ignored(self) -> bool:
+        return self.status == "ignored"
+
+    def __bool__(self) -> bool:
+        return not self.ignored
+
+
+DIRTY_TILE_PRIORITY = {
+    "missing": 300,
+    "nearby-prefetch": 250,
+    "diagnostic-test-render": 200,
+    "manual": 200,
+    "manual-expire": 100,
+}
+
+
+def _dirty_tile_priority(reason: str, override: Optional[int] = None) -> int:
+    if override is not None:
+        return int(override)
+    return DIRTY_TILE_PRIORITY.get(reason, 150)
 
 
 class JobStore:
@@ -149,6 +218,24 @@ class JobStore:
                 if locked:
                     with conn.cursor() as cur:
                         cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (name,))
+
+    @contextmanager
+    def advisory_lock_first(self, names: Iterable[str]) -> Iterator[Optional[str]]:
+        wanted = [name for name in names if name]
+        with self.connect() as conn:
+            locked_name: Optional[str] = None
+            try:
+                with conn.cursor() as cur:
+                    for name in wanted:
+                        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (name,))
+                        if bool(cur.fetchone()[0]):
+                            locked_name = name
+                            break
+                yield locked_name
+            finally:
+                if locked_name:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (locked_name,))
 
     def create_job(self, kind: str, payload: dict[str, Any], status: str = "pending") -> str:
         job_id = str(uuid.uuid4())
@@ -340,16 +427,42 @@ class JobStore:
                 cur.execute(
                     """
                     SELECT
+                        count(*) AS total_rows,
+                        COALESCE(sum(request_count), 0) AS total_requests
+                    FROM tile_admin.dirty_tiles
+                    """
+                )
+                totals_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT
                         min(created_at) FILTER (WHERE status = 'pending') AS oldest_pending,
                         min(leased_at) FILTER (WHERE status = 'leased') AS oldest_leased
                     FROM tile_admin.dirty_tiles
                     """
                 )
                 row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT priority, min(requested_at)
+                    FROM tile_admin.dirty_tiles
+                    WHERE status = 'pending'
+                    GROUP BY priority
+                    ORDER BY priority DESC
+                    """
+                )
+                pending_by_priority = {
+                    int(priority): timestamp.isoformat()
+                    for priority, timestamp in cur.fetchall()
+                    if timestamp is not None
+                }
         return {
             "counts": counts,
             "oldest_pending_at": row[0].isoformat() if row and row[0] else None,
             "oldest_leased_at": row[1].isoformat() if row and row[1] else None,
+            "request_count_total": int(totals_row[1] or 0) if totals_row else 0,
+            "coalesced_requests": max(0, int((totals_row[1] or 0) - (totals_row[0] or 0))) if totals_row else 0,
+            "oldest_pending_by_priority": pending_by_priority,
         }
 
     def recent_failed_dirty_tiles(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -358,7 +471,7 @@ class JobStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, layer, z, x, y, attempts, reason, created_at, leased_at, updated_at
+                    SELECT id, layer, z, x, y, origin_x, origin_y, metatile_size, priority, request_count, attempts, reason, created_at, leased_at, updated_at
                     FROM tile_admin.dirty_tiles
                     WHERE status = 'failed'
                     ORDER BY updated_at DESC
@@ -374,10 +487,45 @@ class JobStore:
                 "z": row[2],
                 "x": row[3],
                 "y": row[4],
-                "attempts": row[5],
-                "error": row[6],
-                "created_at": row[7].isoformat() if row[7] else None,
-                "leased_at": row[8].isoformat() if row[8] else None,
+                "origin_x": row[5],
+                "origin_y": row[6],
+                "metatile_size": row[7],
+                "priority": row[8],
+                "request_count": row[9],
+                "attempts": row[10],
+                "error": row[11],
+                "created_at": row[12].isoformat() if row[12] else None,
+                "leased_at": row[13].isoformat() if row[13] else None,
+                "updated_at": row[14].isoformat() if row[14] else None,
+            }
+            for row in rows
+        ]
+
+    def dirty_tile_hotspots(self, limit: int = 10) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 50))
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT layer, z, origin_x, origin_y, metatile_size, priority, request_count, status, requested_at, updated_at
+                    FROM tile_admin.dirty_tiles
+                    ORDER BY request_count DESC, requested_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "layer": row[0],
+                "z": row[1],
+                "origin_x": row[2],
+                "origin_y": row[3],
+                "metatile_size": row[4],
+                "priority": row[5],
+                "request_count": row[6],
+                "status": row[7],
+                "requested_at": row[8].isoformat() if row[8] else None,
                 "updated_at": row[9].isoformat() if row[9] else None,
             }
             for row in rows
@@ -424,36 +572,95 @@ class JobStore:
             "dirty_tiles_by_status": dirty_counts,
         }
 
-    def enqueue_dirty_tile(self, tile: TileRef, reason: str = "missing") -> bool:
+    def enqueue_dirty_tile(
+        self,
+        tile: TileRef,
+        reason: str = "missing",
+        metatile_size: int = 8,
+        priority: Optional[int] = None,
+    ) -> DirtyTileEnqueueResult:
+        origin = metatile_origin(tile, metatile_size)
+        effective_priority = _dirty_tile_priority(reason, priority)
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO tile_admin.dirty_tiles (layer, z, x, y, reason)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING
+                    INSERT INTO tile_admin.dirty_tiles (
+                        layer, z, x, y, origin_x, origin_y, metatile_size, reason, priority, request_count, requested_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now())
+                    ON CONFLICT (layer, z, origin_x, origin_y, metatile_size)
+                    WHERE status IN ('pending', 'leased')
+                    DO UPDATE
+                    SET reason = excluded.reason,
+                        priority = GREATEST(tile_admin.dirty_tiles.priority, excluded.priority),
+                        request_count = tile_admin.dirty_tiles.request_count + 1,
+                        requested_at = now(),
+                        available_after = LEAST(tile_admin.dirty_tiles.available_after, now()),
+                        updated_at = now()
+                    RETURNING id, (xmax = 0) AS created
                     """,
-                    (tile.layer, tile.z, tile.x, tile.y, reason),
+                    (
+                        tile.layer,
+                        tile.z,
+                        tile.x,
+                        tile.y,
+                        origin.x,
+                        origin.y,
+                        metatile_size,
+                        reason,
+                        effective_priority,
+                    ),
                 )
-                return cur.rowcount > 0
+                row = cur.fetchone()
+        if not row:
+            return DirtyTileEnqueueResult("ignored")
+        return DirtyTileEnqueueResult("created" if row[1] else "coalesced", dirty_id=int(row[0]))
 
-    def enqueue_dirty_tiles(self, tiles: Iterable[TileRef], reason: str = "manual") -> int:
+    def enqueue_dirty_tiles(
+        self,
+        tiles: Iterable[TileRef],
+        reason: str = "manual",
+        metatile_size: int = 8,
+        priority: Optional[int] = None,
+    ) -> int:
         count = 0
         with self.connect() as conn:
             with conn.cursor() as cur:
                 for tile in tiles:
+                    origin = metatile_origin(tile, metatile_size)
                     cur.execute(
                         """
-                        INSERT INTO tile_admin.dirty_tiles (layer, z, x, y, reason)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT DO NOTHING
+                        INSERT INTO tile_admin.dirty_tiles (
+                            layer, z, x, y, origin_x, origin_y, metatile_size, reason, priority, request_count, requested_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now())
+                        ON CONFLICT (layer, z, origin_x, origin_y, metatile_size)
+                        WHERE status IN ('pending', 'leased')
+                        DO UPDATE
+                        SET reason = excluded.reason,
+                            priority = GREATEST(tile_admin.dirty_tiles.priority, excluded.priority),
+                            request_count = tile_admin.dirty_tiles.request_count + 1,
+                            requested_at = now(),
+                            available_after = LEAST(tile_admin.dirty_tiles.available_after, now()),
+                            updated_at = now()
                         """,
-                        (tile.layer, tile.z, tile.x, tile.y, reason),
+                        (
+                            tile.layer,
+                            tile.z,
+                            tile.x,
+                            tile.y,
+                            origin.x,
+                            origin.y,
+                            metatile_size,
+                            reason,
+                            _dirty_tile_priority(reason, priority),
+                        ),
                     )
                     count += cur.rowcount
         return count
 
-    def lease_dirty_tiles(self, limit: int) -> list[tuple[int, TileRef]]:
+    def lease_dirty_tiles(self, limit: int) -> list[DirtyTileJob]:
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -462,7 +669,7 @@ class JobStore:
                         SELECT id
                         FROM tile_admin.dirty_tiles
                         WHERE status = 'pending' AND available_after <= now()
-                        ORDER BY created_at
+                        ORDER BY priority DESC, requested_at, created_at
                         FOR UPDATE SKIP LOCKED
                         LIMIT %s
                     )
@@ -473,12 +680,26 @@ class JobStore:
                         updated_at = now()
                     FROM next_tiles
                     WHERE d.id = next_tiles.id
-                    RETURNING d.id, d.layer, d.z, d.x, d.y
+                    RETURNING d.id, d.layer, d.z, d.x, d.y, d.origin_x, d.origin_y, d.metatile_size,
+                              d.priority, d.request_count, d.requested_at, d.reason, d.attempts
                     """,
                     (limit,),
                 )
                 rows = cur.fetchall()
-        return [(row[0], TileRef(row[1], row[2], row[3], row[4])) for row in rows]
+        return [
+            DirtyTileJob(
+                id=row[0],
+                tile=TileRef(row[1], row[2], row[3], row[4]),
+                origin=TileRef(row[1], row[2], row[5], row[6]),
+                metatile_size=row[7],
+                priority=row[8],
+                request_count=row[9],
+                requested_at=row[10],
+                reason=row[11],
+                attempts=row[12],
+            )
+            for row in rows
+        ]
 
     def complete_dirty_tile(self, dirty_id: int) -> None:
         self._finish_dirty_tile(dirty_id, "done", None)
@@ -734,7 +955,11 @@ class JobRunner:
         tiles = []
         for entry in payload.get("tiles", []):
             tiles.append(TileRef(entry.get("layer", self.config.default_layer), int(entry["z"]), int(entry["x"]), int(entry["y"])))
-        count = self.store.enqueue_dirty_tiles(tiles, reason=payload.get("reason", "manual-expire"))
+        count = self.store.enqueue_dirty_tiles(
+            tiles,
+            reason=payload.get("reason", "manual-expire"),
+            metatile_size=self.config.metatile_size,
+        )
         return {"enqueued": count}
 
     def _run_external_data_load(self, payload: dict[str, Any], job_id: str = "manual") -> dict[str, Any]:

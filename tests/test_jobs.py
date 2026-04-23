@@ -2,13 +2,87 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from tests.helpers import minimal_config
-from tile_server.jobs import CommandBuilder, CommandExecutionError, EXTERNAL_DATA_PLACEHOLDERS_SQL, JobError, JobRunner
+from tile_server.jobs import (
+    CommandBuilder,
+    CommandExecutionError,
+    EXTERNAL_DATA_PLACEHOLDERS_SQL,
+    JobError,
+    JobRunner,
+    JobStore,
+)
+from tile_server.tiles import TileRef
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.executed = []
+        self._row = None
+
+    def execute(self, sql, params):
+        self.executed.append((sql, params))
+        self._row = self.rows.pop(0) if self.rows else None
+
+    def fetchone(self):
+        return self._row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
+
+
+class _FakeJobStore(JobStore):
+    def __init__(self, rows):
+        super().__init__("postgresql://example")
+        self.cursor = _FakeCursor(rows)
+
+    @contextmanager
+    def connect(self):
+        yield _FakeConnection(self.cursor)
 
 
 class JobCommandTests(unittest.TestCase):
+    def test_enqueue_dirty_tile_reports_created_status(self):
+        store = _FakeJobStore([(123, True)])
+
+        result = store.enqueue_dirty_tile(TileRef("default", 4, 9, 10), metatile_size=4)
+
+        self.assertEqual(result.status, "created")
+        self.assertTrue(result.created)
+        sql, params = store.cursor.executed[0]
+        self.assertIn("RETURNING id, (xmax = 0) AS created", sql)
+        self.assertEqual(params[4:7], (8, 8, 4))
+
+    def test_enqueue_dirty_tile_reports_coalesced_status(self):
+        store = _FakeJobStore([(123, False)])
+
+        result = store.enqueue_dirty_tile(TileRef("default", 4, 9, 10), metatile_size=4)
+
+        self.assertEqual(result.status, "coalesced")
+        self.assertTrue(result.coalesced)
+
+    def test_enqueue_dirty_tile_reports_ignored_status_when_no_row_changes(self):
+        store = _FakeJobStore([None])
+
+        result = store.enqueue_dirty_tile(TileRef("default", 4, 9, 10), metatile_size=4)
+
+        self.assertEqual(result.status, "ignored")
+        self.assertTrue(result.ignored)
+
     def test_import_command_uses_external_database(self):
         config = minimal_config(import_database_url="postgresql://import:secret@db:5432/gis", import_threads=6)
         command = CommandBuilder(config).import_command({"pbf_uri": "/data/import/region.osm.pbf"})

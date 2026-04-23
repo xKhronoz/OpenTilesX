@@ -24,6 +24,11 @@ class TileStorage:
     def put(self, tile: TileRef, data: bytes, content_type: str = "image/png") -> None:
         raise NotImplementedError
 
+    def put_many(self, tiles: list[tuple[TileRef, bytes]], content_type: str = "image/png") -> int:
+        for tile, data in tiles:
+            self.put(tile, data, content_type=content_type)
+        return len(tiles)
+
     def delete(self, tile: TileRef) -> None:
         raise NotImplementedError
 
@@ -64,6 +69,24 @@ class FilesystemTileStorage(TileStorage):
         finally:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
+
+    def put_many(self, tiles: list[tuple[TileRef, bytes]], content_type: str = "image/png") -> int:
+        prepared: list[tuple[str, Path]] = []
+        try:
+            for tile, data in tiles:
+                path = self._path(tile)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(prefix=".tile-", suffix=".tmp", dir=str(path.parent))
+                with os.fdopen(fd, "wb") as tmp:
+                    tmp.write(data)
+                prepared.append((tmp_name, path))
+            for tmp_name, path in prepared:
+                os.replace(tmp_name, path)
+            return len(prepared)
+        finally:
+            for tmp_name, _path in prepared:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
 
     def delete(self, tile: TileRef) -> None:
         path = self._path(tile)
@@ -128,6 +151,11 @@ class S3TileStorage(TileStorage):
             ContentType=content_type,
             CacheControl="public, max-age=3600",
         )
+
+    def put_many(self, tiles: list[tuple[TileRef, bytes]], content_type: str = "image/png") -> int:
+        for tile, data in tiles:
+            self.put(tile, data, content_type=content_type)
+        return len(tiles)
 
     def delete(self, tile: TileRef) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=self._key(tile))

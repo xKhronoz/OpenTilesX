@@ -1,6 +1,6 @@
 # OpenTilesX Architecture
 
-This project is now organized as a set of role-based containers that share one external PostgreSQL/PostGIS authority and one configured rendered-tile store. The runtime containers do not start PostgreSQL, Apache, nginx, cron, or renderd internally.
+This project is organized as a set of role-based containers that share one external PostgreSQL/PostGIS authority and one configured rendered-tile store. The runtime containers do not start PostgreSQL, Apache, nginx, cron, or renderd internally.
 
 The design supports cloud deployments such as OCI, ordinary container hosts, and Kubernetes clusters. It also supports isolated environments where runtime containers cannot reach the public internet.
 
@@ -40,23 +40,28 @@ Command: `render-worker`
 
 Render workers claim pending dirty tiles, render Mapnik PNGs from external PostGIS, and write results to the configured tile store. Multiple workers can run at the same time because leases and job state are coordinated through PostgreSQL.
 
-Render workers need `RENDER_DATABASE_URL` and a metadata database URL. In most deployments, metadata is provided by `CONTROL_DATABASE_URL`.
+Render workers need `RENDER_DATABASE_URL` and a metadata database URL. In most deployments, metadata is provided by `CONTROL_DATABASE_URL`. The render database user should be read-only and should have a conservative connection limit; when a read replica is available, point `RENDER_DATABASE_URL` at that replica instead of the writer primary.
 
 Render workers use metatiles by default:
 
 - `WORKER_ID` identifies each worker in diagnostics; when unset, it defaults to hostname and process id.
 - `RENDER_WORKER_PROCESSES=1` controls how many child worker processes one `render-worker` container supervises.
+- `RENDER_DB_MAX_ACTIVE=2` caps how many metatile renders may hit PostGIS at once across the worker fleet.
+- `RENDER_DB_STATEMENT_TIMEOUT_MS=30000` injects a statement timeout into Mapnik PostGIS datasource connections.
 - `RENDER_BACKEND=python-mapnik|http-sidecar` selects whether the worker renders locally with Python Mapnik or delegates metatile rendering to an HTTP sidecar.
 - `RENDER_BACKEND_URL` is required when `RENDER_BACKEND=http-sidecar`.
 - `METATILE_SIZE=8` renders an 8x8 group as one Mapnik image.
 - `STORE_FULL_METATILE=true` stores every tile from that rendered group, not only the tile that triggered the miss.
-- `WORKER_BATCH_SIZE=32` controls how many dirty records a worker leases before grouping them by metatile origin.
+- `NEARBY_PREFETCH_ENABLED=true` lets the API queue nearby warm-up jobs when a metatile miss is first seen.
+- `NEARBY_PREFETCH_RADIUS=1` expands nearby prefetch by orthogonal metatile steps without adding diagonals.
+- `NEARBY_PREFETCH_PRIORITY=250` keeps nearby prefetch below direct tile misses in the dirty-tile queue.
+- `WORKER_BATCH_SIZE=8` controls how many metatile jobs a worker leases per poll.
 
-This makes the first request in a new area more expensive, but it warms surrounding tiles and avoids repeated style loads and repeated PostGIS reads for adjacent map-preview tiles. Smaller metatiles reduce memory and first-tile latency; larger values should be tested against worker memory, database load, and object-storage write throughput.
+The dirty-tile queue is metatile-centric: repeated misses in the same area are coalesced into one queued render job keyed by metatile origin. This makes the first request in a new area more expensive, but it warms surrounding tiles and avoids repeated style loads and repeated PostGIS reads for adjacent map-preview tiles. Smaller metatiles reduce memory and first-tile latency; larger values should be tested against worker memory, database load, and object-storage write throughput. When nearby prefetch is enabled, only the first-seen miss for a metatile fans out to the four orthogonal neighboring metatiles, and those extra jobs run at a lower priority than the direct miss.
 
 The default backend is `python-mapnik`. The optional `http-sidecar` backend keeps the same queueing and storage logic, but replaces the render step with `POST /render/metatile` and a tar archive response containing the rendered PNG tiles plus manifest metadata. This keeps the current architecture extensible without making `renderd` or another backend mandatory.
 
-When multiple render workers run, each metatile render is guarded by a PostgreSQL advisory lock keyed by map version, layer, zoom, and metatile origin. A worker that leases dirty tiles for a busy metatile releases them back to pending with a short delay, preventing duplicate renders while keeping the queue live.
+When multiple render workers run, each metatile render is guarded by a PostgreSQL advisory lock keyed by map version, layer, zoom, and metatile origin. Before rendering, workers also acquire one advisory lock from a small render-slot pool keyed by `RENDER_DB_MAX_ACTIVE`, which acts as a hard PostGIS safety cap. A worker that leases a job while slots are busy releases it back to pending with a short delay instead of opening more database work. Render datasource connections carry a read-only session option and statement timeout, so slow queries fail closed instead of piling up indefinitely.
 
 ### Admin Worker
 
@@ -241,7 +246,7 @@ That writes vendored external-data files and `external-data.offline.yml` into th
 
 Use `docker-compose.yml` for a local external-PostGIS topology and a named filesystem tile cache. This mode starts two render workers by default against the same shared tile cache. It is useful for development and small self-hosted installs. It does not mount `examples/map-bundle` by default; import jobs use the image-bundled Carto Lua/style/index files unless a real bundle is mounted and `MAP_BUNDLE_URI` is set.
 
-The Compose file keeps one worker process per renderer container and relies on multiple containers for concurrency. This is a good default for local Docker because worker identity, CPU scheduling, and logs stay easy to follow. Larger deployments can add more renderer replicas, raise `RENDER_WORKER_PROCESSES`, or do both after checking PostgreSQL headroom and storage latency.
+The Compose file keeps one worker process per renderer container, relies on multiple containers for concurrency, and sets `RENDER_DB_MAX_ACTIVE=2` so only two metatile renders may hit PostGIS at once. For interactive browsing it also lowers `METATILE_SIZE` to `4` and keeps nearby ring prefetch enabled so the first uncached tile lands faster without giving up adjacent cache warming. This is a good default for local Docker because worker identity, CPU scheduling, logs, and PostGIS safety stay easy to follow. Larger deployments should add renderer replicas first, then raise `RENDER_DB_MAX_ACTIVE` only after checking PostgreSQL headroom, queue age, and render latency.
 
 ### Docker Compose With S3-Compatible Tiles
 

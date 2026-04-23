@@ -7,14 +7,16 @@ from pathlib import Path
 from unittest import mock
 
 from tests.helpers import minimal_config
+from tile_server.jobs import DirtyTileJob
 from tile_server.rendering import HttpSidecarRenderBackend, RenderWorker
 from tile_server.tiles import TileRef
 
 
 class FakeStore:
-    def __init__(self, leased, lock_acquired=True):
+    def __init__(self, leased, lock_acquired=True, slot_acquired=True):
         self.leased = leased
         self.lock_acquired = lock_acquired
+        self.slot_acquired = slot_acquired
         self.completed = []
         self.failed = []
         self.released = []
@@ -22,7 +24,27 @@ class FakeStore:
         self.settings = {}
 
     def lease_dirty_tiles(self, limit):
-        return self.leased
+        jobs = []
+        for entry in self.leased:
+            if isinstance(entry, DirtyTileJob):
+                jobs.append(entry)
+                continue
+            dirty_id, tile = entry
+            origin = TileRef(tile.layer, tile.z, (tile.x // 4) * 4, (tile.y // 4) * 4)
+            jobs.append(
+                DirtyTileJob(
+                    id=dirty_id,
+                    tile=tile,
+                    origin=origin,
+                    metatile_size=4,
+                    priority=300,
+                    request_count=1,
+                    requested_at=datetime.now(timezone.utc),
+                    reason="missing",
+                    attempts=0,
+                )
+            )
+        return jobs
 
     def complete_dirty_tile(self, dirty_id):
         self.completed.append(dirty_id)
@@ -40,6 +62,12 @@ class FakeStore:
         self.lock_name = name
         yield self.lock_acquired
 
+    @contextmanager
+    def advisory_lock_first(self, names):
+        wanted = list(names)
+        self.slot_name = wanted[0] if self.slot_acquired else None
+        yield self.slot_name
+
     def set_render_worker_heartbeat(self, worker_id, value=None):
         if value is None:
             value = worker_id
@@ -56,6 +84,11 @@ class FakeStorage:
 
     def put(self, tile, data):
         self.writes.append((tile, data))
+
+    def put_many(self, tiles, content_type="image/png"):
+        for tile, data in tiles:
+            self.put(tile, data)
+        return len(tiles)
 
     def exists(self, tile):
         return tile in self.existing
@@ -88,6 +121,7 @@ class RenderWorkerTests(unittest.TestCase):
         self.assertEqual(len(storage.writes), 16)
         self.assertEqual(store.completed, [101])
         self.assertIn("tile_admin.metatile:default:default:4:8:8", store.lock_name)
+        self.assertEqual(store.slot_name, "tile_admin.renderdb:default:0")
         self.assertEqual(store.heartbeat["worker_id"], "renderer-a")
         self.assertEqual(store.heartbeat["metatile_size"], 4)
         self.assertTrue(store.heartbeat["store_full_metatile"])
@@ -105,7 +139,7 @@ class RenderWorkerTests(unittest.TestCase):
 
     def test_run_once_releases_tiles_when_metatile_lock_is_busy(self):
         dirty_tile = TileRef("default", 4, 9, 10)
-        store = FakeStore([(101, dirty_tile)], lock_acquired=False)
+        store = FakeStore([(101, dirty_tile)], lock_acquired=False, slot_acquired=True)
         storage = FakeStorage()
         renderer = FakeRenderer()
         worker = RenderWorker(minimal_config(metatile_size=4), store, storage)
@@ -121,7 +155,21 @@ class RenderWorkerTests(unittest.TestCase):
         self.assertEqual(store.released[0][2], "metatile-lock-contended")
         self.assertEqual(store.heartbeat["state"], "deferred")
 
-    def test_run_once_completes_dirty_tile_that_is_already_cached(self):
+    def test_run_once_releases_tiles_when_render_db_slots_are_busy(self):
+        dirty_tile = TileRef("default", 4, 9, 10)
+        store = FakeStore([(101, dirty_tile)], lock_acquired=True, slot_acquired=False)
+        storage = FakeStorage()
+        renderer = FakeRenderer()
+        worker = RenderWorker(minimal_config(metatile_size=4), store, storage)
+        worker.renderer = renderer
+
+        completed = worker.run_once()
+
+        self.assertEqual(completed, 0)
+        self.assertEqual(renderer.calls, [])
+        self.assertEqual(store.released[0][2], "render-db-slot-busy")
+
+    def test_run_once_renders_even_when_individual_tile_already_exists(self):
         dirty_tile = TileRef("default", 4, 9, 10)
         store = FakeStore([(101, dirty_tile)])
         storage = FakeStorage(existing={dirty_tile})
@@ -132,9 +180,9 @@ class RenderWorkerTests(unittest.TestCase):
         completed = worker.run_once()
 
         self.assertEqual(completed, 1)
-        self.assertEqual(renderer.calls, [])
+        self.assertEqual(renderer.calls, [(TileRef("default", 4, 8, 8), 4)])
         self.assertEqual(store.completed, [101])
-        self.assertEqual(storage.writes, [])
+        self.assertEqual(len(storage.writes), 16)
 
     def test_http_sidecar_backend_reads_tile_archive(self):
         archive = io.BytesIO()

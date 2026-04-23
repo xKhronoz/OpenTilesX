@@ -9,6 +9,7 @@ import socket
 import tarfile
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from .config import AppConfig, mask_secret
 from .jobs import JobStore
 from .storage import TileStorage
 from .style import materialize_style_xml
-from .tiles import TileRef, metatile_origin
+from .tiles import TileRef
 
 
 LOGGER = logging.getLogger(__name__)
@@ -161,6 +162,16 @@ class RenderWorker:
         self.last_error_at: datetime | None = None
         self.last_render_seconds = 0.0
         self.last_store_seconds = 0.0
+        self.last_queue_age_seconds = 0.0
+        self.last_render_slot_wait_seconds = 0.0
+        self.render_slot_wait_seconds_total = 0.0
+        self.render_slot_busy_count = 0
+        self.render_slot_acquired_count = 0
+        self.render_timeout_count = 0
+        self.render_failure_count = 0
+        self.metatile_lock_contention_count = 0
+        self.storage_write_count = 0
+        self._recent_failures: deque[bool] = deque(maxlen=5)
         self._idle_logged_at = 0.0
         self._last_error_clear_check = 0.0
 
@@ -173,89 +184,108 @@ class RenderWorker:
 
         LOGGER.info("render-worker leased dirty_tiles=%s", len(leased))
         completed = 0
-        by_origin: dict[TileRef, list[tuple[int, TileRef]]] = {}
-        for dirty_id, tile in leased:
-            if self.config.tile_store == "filesystem":
-                try:
-                    if self.storage.exists(tile):
-                        self.store.complete_dirty_tile(dirty_id)
-                        completed += 1
-                        LOGGER.debug("render-worker completed already cached tile layer=%s z=%s x=%s y=%s", tile.layer, tile.z, tile.x, tile.y)
-                        continue
-                except Exception:
-                    LOGGER.exception("render-worker cache existence check failed layer=%s z=%s x=%s y=%s", tile.layer, tile.z, tile.x, tile.y)
-            by_origin.setdefault(metatile_origin(tile, self.config.metatile_size), []).append((dirty_id, tile))
-
         deferred = 0
-        for origin, dirty_tiles in by_origin.items():
-            dirty_ids = [dirty_id for dirty_id, _tile in dirty_tiles]
+        for job in leased:
+            dirty_ids = [job.id]
+            origin = job.origin
+            self.last_queue_age_seconds = _queue_age_seconds(job.requested_at)
+            if self._should_back_off():
+                released = self.store.release_dirty_tiles(
+                    dirty_ids,
+                    delay_seconds=max(2.0, self.config.worker_poll_interval * 2),
+                    reason="render-backpressure",
+                )
+                deferred += released
+                continue
             try:
-                with self.store.advisory_lock(_metatile_lock_name(self.config.map_version, origin)) as locked:
-                    if not locked:
+                slot_started = time.monotonic()
+                with self.store.advisory_lock_first(_render_db_slot_names(self.config.map_version, self.config.render_db_max_active)) as slot_name:
+                    self.last_render_slot_wait_seconds = time.monotonic() - slot_started
+                    self.render_slot_wait_seconds_total += self.last_render_slot_wait_seconds
+                    if not slot_name:
+                        self.render_slot_busy_count += 1
                         released = self.store.release_dirty_tiles(
                             dirty_ids,
                             delay_seconds=max(1.0, self.config.worker_poll_interval),
-                            reason="metatile-lock-contended",
+                            reason="render-db-slot-busy",
                         )
                         deferred += released
+                        continue
+                    self.render_slot_acquired_count += 1
+                    with self.store.advisory_lock(_metatile_lock_name(self.config.map_version, origin)) as locked:
+                        if not locked:
+                            self.metatile_lock_contention_count += 1
+                            released = self.store.release_dirty_tiles(
+                                dirty_ids,
+                                delay_seconds=max(1.0, self.config.worker_poll_interval),
+                                reason="metatile-lock-contended",
+                            )
+                            deferred += released
+                            LOGGER.info(
+                                "render-worker deferred metatile lock busy layer=%s z=%s x=%s y=%s dirty_tiles=%s released=%s",
+                                origin.layer,
+                                origin.z,
+                                origin.x,
+                                origin.y,
+                                len(dirty_ids),
+                                released,
+                            )
+                            continue
                         LOGGER.info(
-                            "render-worker deferred metatile lock busy layer=%s z=%s x=%s y=%s dirty_tiles=%s released=%s",
+                            "render-worker rendering metatile layer=%s z=%s x=%s y=%s dirty_tiles=%s slot=%s queue_age=%ss",
                             origin.layer,
                             origin.z,
                             origin.x,
                             origin.y,
-                            len(dirty_tiles),
-                            released,
+                            len(dirty_ids),
+                            slot_name,
+                            round(self.last_queue_age_seconds, 3),
                         )
-                        continue
-                    LOGGER.info(
-                        "render-worker rendering metatile layer=%s z=%s x=%s y=%s dirty_tiles=%s",
-                        origin.layer,
-                        origin.z,
-                        origin.x,
-                        origin.y,
-                        len(dirty_tiles),
-                    )
-                    render_started = time.monotonic()
-                    rendered = self.renderer.render_metatile(origin, size=self.config.metatile_size)
-                    self.last_render_seconds = time.monotonic() - render_started
-                    tiles_to_store = rendered.items() if self.config.store_full_metatile else (
-                        (tile, rendered[tile]) for _, tile in dirty_tiles
-                    )
-                    stored = 0
-                    store_started = time.monotonic()
-                    for tile, data in tiles_to_store:
-                        self.storage.put(tile, data)
-                        stored += 1
-                    self.last_store_seconds = time.monotonic() - store_started
-                    for dirty_id, _tile in dirty_tiles:
-                        self.store.complete_dirty_tile(dirty_id)
-                        completed += 1
-                    self.processed_count += len(dirty_tiles)
-                    self.last_error = None
-                    self.last_error_at = None
-                    LOGGER.info(
-                        "render-worker stored tiles=%s completed_dirty_tiles=%s metatile=%s/%s/%s/%s total_processed=%s",
-                        stored,
-                        len(dirty_tiles),
-                        origin.layer,
-                        origin.z,
-                        origin.x,
-                        origin.y,
-                        self.processed_count,
-                    )
+                        self._heartbeat("rendering", leased_count=len(leased))
+                        render_started = time.monotonic()
+                        rendered = self.renderer.render_metatile(origin, size=job.metatile_size)
+                        self.last_render_seconds = time.monotonic() - render_started
+                        tiles_to_store = list(rendered.items()) if self.config.store_full_metatile else [
+                            (job.tile, rendered[job.tile])
+                        ]
+                        self._heartbeat("storing", leased_count=len(leased))
+                        store_started = time.monotonic()
+                        stored = self.storage.put_many(tiles_to_store)
+                        self.last_store_seconds = time.monotonic() - store_started
+                        self.storage_write_count += stored
+                        for dirty_id in dirty_ids:
+                            self.store.complete_dirty_tile(dirty_id)
+                            completed += 1
+                        self.processed_count += len(dirty_ids)
+                        self.last_error = None
+                        self.last_error_at = None
+                        self._recent_failures.append(False)
+                        LOGGER.info(
+                            "render-worker stored tiles=%s completed_dirty_tiles=%s metatile=%s/%s/%s/%s total_processed=%s",
+                            stored,
+                            len(dirty_ids),
+                            origin.layer,
+                            origin.z,
+                            origin.x,
+                            origin.y,
+                            self.processed_count,
+                        )
             except Exception as exc:
                 self.last_error = str(exc)
                 self.last_error_at = datetime.now(timezone.utc)
+                self.render_failure_count += 1
+                if "statement timeout" in str(exc).lower():
+                    self.render_timeout_count += 1
+                self._recent_failures.append(True)
                 LOGGER.exception(
                     "render-worker failed metatile layer=%s z=%s x=%s y=%s dirty_tiles=%s",
                     origin.layer,
                     origin.z,
                     origin.x,
                     origin.y,
-                    len(dirty_tiles),
+                    len(dirty_ids),
                 )
-                for dirty_id, _tile in dirty_tiles:
+                for dirty_id in dirty_ids:
                     self.store.fail_dirty_tile(dirty_id, str(exc))
         state = "processed" if completed else "deferred" if deferred else "failed"
         self._heartbeat(state, leased_count=len(leased))
@@ -306,6 +336,17 @@ class RenderWorker:
                     "store_full_metatile": self.config.store_full_metatile,
                     "last_render_seconds": round(self.last_render_seconds, 4),
                     "last_store_seconds": round(self.last_store_seconds, 4),
+                    "last_queue_age_seconds": round(self.last_queue_age_seconds, 4),
+                    "render_db_max_active": self.config.render_db_max_active,
+                    "render_db_statement_timeout_ms": self.config.render_db_statement_timeout_ms,
+                    "last_render_slot_wait_seconds": round(self.last_render_slot_wait_seconds, 4),
+                    "render_slot_wait_seconds_total": round(self.render_slot_wait_seconds_total, 4),
+                    "render_slot_busy_count": self.render_slot_busy_count,
+                    "render_slot_acquired_count": self.render_slot_acquired_count,
+                    "render_timeout_count": self.render_timeout_count,
+                    "render_failure_count": self.render_failure_count,
+                    "metatile_lock_contention_count": self.metatile_lock_contention_count,
+                    "storage_write_count": self.storage_write_count,
                 }
             )
         except Exception:
@@ -336,6 +377,9 @@ class RenderWorker:
             self.last_error = None
             self.last_error_at = None
 
+    def _should_back_off(self) -> bool:
+        return len(self._recent_failures) >= 3 and sum(1 for failed in self._recent_failures if failed) >= 3
+
 
 def _tile_box(tile: TileRef, mapnik_module: object) -> object:
     tiles = 1 << tile.z
@@ -357,6 +401,16 @@ def _metatile_box(origin: TileRef, tiles_x: int, tiles_y: int, mapnik_module: ob
 
 def _metatile_lock_name(map_version: str, origin: TileRef) -> str:
     return f"tile_admin.metatile:{map_version}:{origin.layer}:{origin.z}:{origin.x}:{origin.y}"
+
+
+def _render_db_slot_names(map_version: str, max_active: int) -> list[str]:
+    return [f"tile_admin.renderdb:{map_version}:{slot}" for slot in range(max(1, max_active))]
+
+
+def _queue_age_seconds(requested_at: datetime | None) -> float:
+    if not requested_at:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - requested_at.astimezone(timezone.utc)).total_seconds())
 
 
 def _parse_timestamp(value: object) -> datetime | None:

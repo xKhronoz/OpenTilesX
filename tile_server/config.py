@@ -62,6 +62,11 @@ class AppConfig:
     render_worker_processes: int
     render_backend: str
     render_backend_url: Optional[str]
+    render_db_max_active: int
+    render_db_statement_timeout_ms: int
+    nearby_prefetch_enabled: bool
+    nearby_prefetch_radius: int
+    nearby_prefetch_priority: int
     osm2pgsql_extra_args: str
     import_source_mode: str
     allow_internal_import_downloads: bool
@@ -122,6 +127,11 @@ class AppConfig:
             render_worker_processes=env_int("RENDER_WORKER_PROCESSES", 1),
             render_backend=os.getenv("RENDER_BACKEND", "python-mapnik").strip().lower(),
             render_backend_url=os.getenv("RENDER_BACKEND_URL"),
+            render_db_max_active=env_int("RENDER_DB_MAX_ACTIVE", 2),
+            render_db_statement_timeout_ms=env_int("RENDER_DB_STATEMENT_TIMEOUT_MS", 30000),
+            nearby_prefetch_enabled=env_bool("NEARBY_PREFETCH_ENABLED", True),
+            nearby_prefetch_radius=env_int("NEARBY_PREFETCH_RADIUS", 1),
+            nearby_prefetch_priority=env_int("NEARBY_PREFETCH_PRIORITY", 250),
             osm2pgsql_extra_args=os.getenv("OSM2PGSQL_EXTRA_ARGS", ""),
             import_source_mode=os.getenv("IMPORT_SOURCE_MODE", "local").strip().lower(),
             allow_internal_import_downloads=env_bool("ALLOW_INTERNAL_IMPORT_DOWNLOADS", False),
@@ -172,6 +182,14 @@ class AppConfig:
             raise ConfigError("IMPORT_THREADS must be at least 1")
         if self.render_worker_processes < 1:
             raise ConfigError("RENDER_WORKER_PROCESSES must be at least 1")
+        if self.render_db_max_active < 1:
+            raise ConfigError("RENDER_DB_MAX_ACTIVE must be at least 1")
+        if self.render_db_statement_timeout_ms < 1:
+            raise ConfigError("RENDER_DB_STATEMENT_TIMEOUT_MS must be at least 1")
+        if self.nearby_prefetch_radius < 0:
+            raise ConfigError("NEARBY_PREFETCH_RADIUS must be at least 0")
+        if self.nearby_prefetch_priority < 1:
+            raise ConfigError("NEARBY_PREFETCH_PRIORITY must be at least 1")
         if self.render_backend == "http-sidecar" and self.role == "render-worker" and not self.render_backend_url:
             raise ConfigError("RENDER_BACKEND_URL is required when RENDER_BACKEND=http-sidecar")
 

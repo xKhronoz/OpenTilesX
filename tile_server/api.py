@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -14,12 +15,19 @@ from urllib.parse import parse_qs, urlparse
 from .bundles import MapBundleValidator, bundle_checksum
 from .config import AppConfig, mask_secret
 from .external_data import ExternalDataManager
-from .jobs import JobStore
+from .jobs import DirtyTileEnqueueResult, JobStore
 from .storage import TileStorage
-from .tiles import TileError, TileRef
+from .tiles import TileError, TileRef, metatile_origin
 
 
 LOGGER = logging.getLogger(__name__)
+_METRICS_LOCK = threading.Lock()
+_METRICS = {
+    "tile_hits_total": 0,
+    "tile_misses_total": 0,
+    "tile_queued_total": 0,
+    "tile_enqueue_deduped_total": 0,
+}
 
 JOB_ENDPOINTS = {
     "/admin/jobs/import": "import",
@@ -69,7 +77,7 @@ class TileApiHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/metrics":
-            self._text("opentilesx_up 1\n", content_type="text/plain; version=0.0.4")
+            self._text(_metrics_payload(self.config, self.store), content_type="text/plain; version=0.0.4")
             return
         if path == "/admin":
             self._admin_panel()
@@ -129,6 +137,7 @@ class TileApiHandler(BaseHTTPRequestHandler):
 
         obj = self.storage.get(tile)
         if obj:
+            _metric_add("tile_hits_total")
             LOGGER.debug("tile cache hit layer=%s z=%s x=%s y=%s", tile.layer, tile.z, tile.x, tile.y)
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", obj.content_type)
@@ -138,11 +147,14 @@ class TileApiHandler(BaseHTTPRequestHandler):
             self.wfile.write(obj.data)
             return
 
+        _metric_add("tile_misses_total")
         try:
-            inserted = self.store.enqueue_dirty_tile(tile)
+            enqueue_result = _coerce_enqueue_result(
+                self.store.enqueue_dirty_tile(tile, metatile_size=self.config.metatile_size)
+            )
             LOGGER.info(
-                "tile cache miss enqueued=%s layer=%s z=%s x=%s y=%s",
-                inserted,
+                "tile cache miss enqueue_status=%s layer=%s z=%s x=%s y=%s",
+                enqueue_result.status,
                 tile.layer,
                 tile.z,
                 tile.x,
@@ -152,6 +164,11 @@ class TileApiHandler(BaseHTTPRequestHandler):
             LOGGER.exception("tile cache miss enqueue failed layer=%s z=%s x=%s y=%s", tile.layer, tile.z, tile.x, tile.y)
             self._json({"error": f"Tile missing and render enqueue failed: {exc}"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
             return
+        _metric_add("tile_queued_total")
+        if not enqueue_result.created:
+            _metric_add("tile_enqueue_deduped_total")
+        if enqueue_result.created:
+            self._enqueue_nearby_prefetch(tile)
 
         self._json({"status": "queued", "tile": tile.__dict__}, status=HTTPStatus.ACCEPTED, headers={"Retry-After": "3"})
 
@@ -172,6 +189,7 @@ class TileApiHandler(BaseHTTPRequestHandler):
                 heartbeats = [heartbeat] if heartbeat else []
             dirty_tiles = self.store.dirty_tile_counts()
             failures = self.store.recent_failed_dirty_tiles(limit=failures_limit)
+            hotspots = self.store.dirty_tile_hotspots(limit=10) if hasattr(self.store, "dirty_tile_hotspots") else []
         except Exception as exc:
             self._json({"error": str(exc)}, status=HTTPStatus.SERVICE_UNAVAILABLE)
             return
@@ -181,8 +199,10 @@ class TileApiHandler(BaseHTTPRequestHandler):
             {
                 "render_worker": _render_worker_summary(workers, self.config.worker_poll_interval),
                 "render_workers": workers,
+                "render_db": _render_db_summary(workers, self.config),
                 "rendering": _rendering_summary(self.config),
                 "dirty_tiles": dirty_tiles,
+                "hot_metatiles": hotspots,
                 "recent_failures": failures,
                 "recent_failures_limit": failures_limit,
                 "storage": _storage_summary(self.config),
@@ -214,13 +234,18 @@ class TileApiHandler(BaseHTTPRequestHandler):
             return
         try:
             exists = self.storage.exists(tile)
-            enqueued = False if exists else self.store.enqueue_dirty_tile(tile, reason="diagnostic-test-render")
+            enqueue_result = None if exists else _coerce_enqueue_result(self.store.enqueue_dirty_tile(
+                tile,
+                reason="diagnostic-test-render",
+                metatile_size=self.config.metatile_size,
+            ))
         except Exception as exc:
             self._json({"error": str(exc)}, status=HTTPStatus.SERVICE_UNAVAILABLE)
             return
+        enqueued = bool(enqueue_result) if enqueue_result is not None else False
         self._json(
             {
-                "status": "exists" if exists else "queued",
+                "status": "exists" if exists else "queued" if enqueued else "ignored",
                 "exists": exists,
                 "enqueued": enqueued,
                 "tile": tile.__dict__,
@@ -229,6 +254,26 @@ class TileApiHandler(BaseHTTPRequestHandler):
             status=HTTPStatus.OK if exists else HTTPStatus.ACCEPTED,
             headers={"Retry-After": "3"} if not exists else None,
         )
+
+    def _enqueue_nearby_prefetch(self, tile: TileRef) -> None:
+        if not self.config.nearby_prefetch_enabled or self.config.nearby_prefetch_radius < 1:
+            return
+        for neighbor in _nearby_prefetch_tiles(tile, self.config.metatile_size, self.config.nearby_prefetch_radius):
+            try:
+                self.store.enqueue_dirty_tile(
+                    neighbor,
+                    reason="nearby-prefetch",
+                    metatile_size=self.config.metatile_size,
+                    priority=self.config.nearby_prefetch_priority,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "nearby prefetch enqueue failed layer=%s z=%s x=%s y=%s",
+                    neighbor.layer,
+                    neighbor.z,
+                    neighbor.x,
+                    neighbor.y,
+                )
 
     def _admin_clear_jobs(self) -> None:
         if not self._authorized():
@@ -555,6 +600,11 @@ def _rendering_summary(config: AppConfig) -> dict[str, Any]:
         "worker_processes": config.render_worker_processes,
         "metatile_size": config.metatile_size,
         "store_full_metatile": config.store_full_metatile,
+        "render_db_max_active": config.render_db_max_active,
+        "render_db_statement_timeout_ms": config.render_db_statement_timeout_ms,
+        "nearby_prefetch_enabled": config.nearby_prefetch_enabled,
+        "nearby_prefetch_radius": config.nearby_prefetch_radius,
+        "nearby_prefetch_priority": config.nearby_prefetch_priority,
         "import_threads": config.import_threads,
         "threads_compat": config.threads,
     }
@@ -568,10 +618,109 @@ def _database_summary(config: AppConfig) -> dict[str, str]:
     }
 
 
+def _render_db_summary(workers: list[dict[str, Any]], config: AppConfig) -> dict[str, Any]:
+    active_slots = sum(1 for worker in workers if worker.get("state") in {"rendering", "storing"})
+    slot_busy = sum(int(worker.get("render_slot_busy_count") or 0) for worker in workers)
+    slot_wait_total = round(sum(float(worker.get("render_slot_wait_seconds_total") or 0.0) for worker in workers), 4)
+    timeout_total = sum(int(worker.get("render_timeout_count") or 0) for worker in workers)
+    failure_total = sum(int(worker.get("render_failure_count") or 0) for worker in workers)
+    contention_total = sum(int(worker.get("metatile_lock_contention_count") or 0) for worker in workers)
+    return {
+        "max_active": config.render_db_max_active,
+        "active_slots": active_slots,
+        "slot_busy_count": slot_busy,
+        "slot_wait_seconds_total": slot_wait_total,
+        "render_timeout_count": timeout_total,
+        "render_failure_count": failure_total,
+        "metatile_lock_contention_count": contention_total,
+    }
+
+
+def _coerce_enqueue_result(result: DirtyTileEnqueueResult | bool) -> DirtyTileEnqueueResult:
+    if isinstance(result, DirtyTileEnqueueResult):
+        return result
+    return DirtyTileEnqueueResult("created" if result else "coalesced")
+
+
+def _metric_add(name: str, value: int = 1) -> None:
+    with _METRICS_LOCK:
+        _METRICS[name] = _METRICS.get(name, 0) + value
+
+
+def _metric_snapshot() -> dict[str, int]:
+    with _METRICS_LOCK:
+        return dict(_METRICS)
+
+
+def _metrics_payload(config: AppConfig, store: JobStore) -> str:
+    lines = ["opentilesx_up 1"]
+    snapshot = _metric_snapshot()
+    for key, value in sorted(snapshot.items()):
+        lines.append(f"opentilesx_{key} {value}")
+    try:
+        counts = store.dirty_tile_counts()
+        heartbeats = store.render_worker_heartbeats() if hasattr(store, "render_worker_heartbeats") else []
+        render_db = _render_db_summary(
+            [_render_worker_health(heartbeat, config.worker_poll_interval) for heartbeat in heartbeats],
+            config,
+        )
+        for status, value in sorted((counts.get("counts") or {}).items()):
+            lines.append(f'opentilesx_dirty_tiles{{status="{status}"}} {int(value)}')
+        lines.append(f'opentilesx_dirty_tile_request_count_total {int(counts.get("request_count_total") or 0)}')
+        lines.append(f'opentilesx_dirty_tile_coalesced_requests_total {int(counts.get("coalesced_requests") or 0)}')
+        oldest_pending = _parse_timestamp(counts.get("oldest_pending_at"))
+        if oldest_pending:
+            age = max(0.0, (datetime.now(timezone.utc) - oldest_pending).total_seconds())
+            lines.append(f"opentilesx_queue_oldest_pending_seconds {round(age, 4)}")
+        lines.append(f"opentilesx_render_db_slots_max {render_db['max_active']}")
+        lines.append(f"opentilesx_render_db_slots_active {render_db['active_slots']}")
+        lines.append(f"opentilesx_render_slot_busy_total {render_db['slot_busy_count']}")
+        lines.append(f"opentilesx_render_slot_wait_seconds_total {render_db['slot_wait_seconds_total']}")
+        lines.append(f"opentilesx_render_timeouts_total {render_db['render_timeout_count']}")
+        lines.append(f"opentilesx_render_failures_total {render_db['render_failure_count']}")
+        lines.append(f"opentilesx_metatile_lock_contention_total {render_db['metatile_lock_contention_count']}")
+        for worker in heartbeats:
+            worker_id = str(worker.get("worker_id") or "unknown").replace('"', "_")
+            lines.append(
+                f'opentilesx_render_last_duration_seconds{{worker="{worker_id}"}} {float(worker.get("last_render_seconds") or 0.0)}'
+            )
+            lines.append(
+                f'opentilesx_store_last_duration_seconds{{worker="{worker_id}"}} {float(worker.get("last_store_seconds") or 0.0)}'
+            )
+            lines.append(
+                f'opentilesx_render_slot_wait_last_seconds{{worker="{worker_id}"}} {float(worker.get("last_render_slot_wait_seconds") or 0.0)}'
+            )
+    except Exception:
+        lines.append("opentilesx_metrics_error 1")
+    return "\n".join(lines) + "\n"
+
+
 def _tile_url(tile: TileRef, default_layer: str) -> str:
     if tile.layer == default_layer:
         return f"/tile/{tile.z}/{tile.x}/{tile.y}.png"
     return f"/tile/{tile.layer}/{tile.z}/{tile.x}/{tile.y}.png"
+
+
+def _nearby_prefetch_tiles(tile: TileRef, metatile_size: int, radius: int) -> list[TileRef]:
+    origin = metatile_origin(tile, metatile_size)
+    max_coord = 1 << tile.z
+    seen: set[tuple[int, int]] = set()
+    neighbors: list[TileRef] = []
+    for step in range(1, radius + 1):
+        offset = metatile_size * step
+        for x, y in (
+            (origin.x + offset, origin.y),
+            (origin.x - offset, origin.y),
+            (origin.x, origin.y + offset),
+            (origin.x, origin.y - offset),
+        ):
+            if x < 0 or y < 0 or x >= max_coord or y >= max_coord:
+                continue
+            if (x, y) in seen:
+                continue
+            seen.add((x, y))
+            neighbors.append(TileRef(tile.layer, tile.z, x, y))
+    return neighbors
 
 
 def _style_dir_for_summary(config: AppConfig) -> Path | None:

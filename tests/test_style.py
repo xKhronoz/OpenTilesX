@@ -70,6 +70,9 @@ class StyleMaterializationTests(unittest.TestCase):
             self.assertIn("old-host", source.read_text())
             self.assertIn("<Parameter name=\"host\">postgis</Parameter>", target.read_text())
             self.assertIn("<Parameter name=\"dbname\">gis</Parameter>", target.read_text())
+            self.assertIn("<Parameter name=\"application_name\">opentilesx-render</Parameter>", target.read_text())
+            self.assertIn("default_transaction_read_only=on", target.read_text())
+            self.assertIn("statement_timeout=30000", target.read_text())
 
     def test_materialize_bundle_style_assets(self):
         with tempfile.TemporaryDirectory() as tmp:

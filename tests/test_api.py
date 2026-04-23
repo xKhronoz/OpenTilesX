@@ -7,16 +7,19 @@ from pathlib import Path
 
 from tests.helpers import minimal_config
 from tile_server.api import TileApiHandler
+from tile_server.jobs import DirtyTileEnqueueResult
 from tile_server.storage import TileObject
+from tile_server.tiles import TileRef
 
 
 class _Store:
-    def __init__(self):
+    def __init__(self, enqueue_statuses=None):
         self.created = []
         self.enqueued = []
         self.cleared_jobs = 0
         self.cleared_diagnostics = 0
         self.last_failures_limit = None
+        self.enqueue_statuses = list(enqueue_statuses or ["created"])
 
     def create_job(self, kind, payload):
         self.created.append((kind, payload))
@@ -76,9 +79,15 @@ class _Store:
         self.last_failures_limit = limit
         return [{"layer": "default", "z": 1, "x": 0, "y": 0, "attempts": 1, "error": "mapnik failed", "updated_at": "2026-01-01T00:00:00+00:00"}]
 
-    def enqueue_dirty_tile(self, tile, reason="missing"):
-        self.enqueued.append((tile, reason))
-        return True
+    def dirty_tile_hotspots(self, limit=10):
+        return [{"layer": "default", "z": 1, "origin_x": 0, "origin_y": 0, "metatile_size": 8, "priority": 300, "request_count": 4}]
+
+    def enqueue_dirty_tile(self, tile, reason="missing", metatile_size=8, priority=None):
+        self.enqueued.append((tile, reason, metatile_size, priority))
+        status = self.enqueue_statuses.pop(0) if self.enqueue_statuses else "created"
+        if isinstance(status, DirtyTileEnqueueResult):
+            return status
+        return DirtyTileEnqueueResult(status)
 
     def clear_jobs(self):
         self.cleared_jobs += 1
@@ -103,26 +112,38 @@ class _Storage:
 
 
 class _Handler(TileApiHandler):
-    def __init__(self, config, store, path="/admin/jobs", token=None, payload=None, headers=None, body=b""):
+    def __init__(self, config, store, path="/admin/jobs", token=None, payload=None, headers=None, body=b"", storage=None):
         self.config = config
         self.store = store
-        self.storage = _Storage()
+        self.storage = storage or _Storage()
         self.path = path
         self.payload = payload or {}
         self.headers = headers or {}
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
         self.rfile = io.BytesIO(body)
+        self.wfile = io.BytesIO()
         self.response = None
         self.error = None
         self.text = None
         self.bytes = None
+        self.sent_status = None
+        self.sent_headers = {}
 
     def _json(self, payload, status=200, headers=None):
         self.response = {"status": int(status), "payload": payload, "headers": headers or {}}
 
     def send_error(self, status, message=None):
         self.error = {"status": int(status), "message": message}
+
+    def send_response(self, status, message=None):
+        self.sent_status = int(status)
+
+    def send_header(self, keyword, value):
+        self.sent_headers[keyword] = value
+
+    def end_headers(self):
+        return None
 
     def _read_json(self):
         return self.payload
@@ -141,6 +162,74 @@ class _Handler(TileApiHandler):
 
 
 class AdminApiTests(unittest.TestCase):
+    def test_tile_miss_enqueues_primary_and_nearby_ring(self):
+        store = _Store()
+        handler = _Handler(
+            minimal_config(metatile_size=4),
+            store,
+            path="/tile/4/9/10.png",
+            storage=_Storage(exists=False),
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(handler.response["status"], 202)
+        self.assertEqual(len(store.enqueued), 5)
+        self.assertEqual(store.enqueued[0], (TileRef("default", 4, 9, 10), "missing", 4, None))
+        self.assertEqual(
+            {(tile.x, tile.y, reason, priority) for tile, reason, _size, priority in store.enqueued[1:]},
+            {
+                (12, 8, "nearby-prefetch", 250),
+                (4, 8, "nearby-prefetch", 250),
+                (8, 12, "nearby-prefetch", 250),
+                (8, 4, "nearby-prefetch", 250),
+            },
+        )
+
+    def test_tile_miss_does_not_prefetch_when_primary_metatile_is_coalesced(self):
+        store = _Store(enqueue_statuses=["coalesced"])
+        handler = _Handler(
+            minimal_config(metatile_size=4),
+            store,
+            path="/tile/4/9/10.png",
+            storage=_Storage(exists=False),
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(handler.response["status"], 202)
+        self.assertEqual(store.enqueued, [(TileRef("default", 4, 9, 10), "missing", 4, None)])
+
+    def test_tile_miss_only_prefetches_valid_neighbors_at_world_edge(self):
+        store = _Store()
+        handler = _Handler(
+            minimal_config(metatile_size=4),
+            store,
+            path="/tile/0/0/0.png",
+            storage=_Storage(exists=False),
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(handler.response["status"], 202)
+        self.assertEqual(store.enqueued, [(TileRef("default", 0, 0, 0), "missing", 4, None)])
+
+    def test_tile_hit_returns_png_without_enqueuing(self):
+        store = _Store()
+        handler = _Handler(
+            minimal_config(),
+            store,
+            path="/tile/1/0/0.png",
+            storage=_Storage(exists=True),
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(handler.sent_status, 200)
+        self.assertEqual(handler.sent_headers["Content-Type"], "image/png")
+        self.assertEqual(handler.wfile.getvalue(), b"png")
+        self.assertEqual(store.enqueued, [])
+
     def test_root_panel_serves_static_html_even_when_admin_disabled(self):
         handler = _Handler(minimal_config(admin_enabled=False), _Store())
         handler.path = "/"
@@ -314,8 +403,10 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(payload["render_worker"]["total"], 2)
         self.assertEqual(payload["render_worker"]["processed_count"], 18)
         self.assertEqual(len(payload["render_workers"]), 2)
+        self.assertIn("render_db", payload)
         self.assertIn("dirty_tiles", payload)
         self.assertEqual(payload["dirty_tiles"]["counts"]["pending"], 2)
+        self.assertIn("hot_metatiles", payload)
         self.assertIn("recent_failures", payload)
         self.assertIn("rendering", payload)
         self.assertEqual(payload["rendering"]["backend"], "python-mapnik")
@@ -380,6 +471,13 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(handler.response["payload"]["cleared"]["heartbeats_deleted"], 2)
         self.assertEqual(handler.response["payload"]["cleared"]["dirty_tiles_deleted"], 3)
         self.assertEqual(store.cleared_diagnostics, 1)
+
+    def test_metrics_endpoint_reports_queue_and_renderer_state(self):
+        handler = _Handler(minimal_config(), _Store(), path="/metrics")
+        handler.do_GET()
+        self.assertIn("opentilesx_up 1", handler.text["payload"])
+        self.assertIn("opentilesx_dirty_tiles{status=\"pending\"} 2", handler.text["payload"])
+        self.assertIn("opentilesx_render_db_slots_max 2", handler.text["payload"])
 
     def test_map_viewer_is_self_contained(self):
         handler = _Handler(minimal_config(), _Store())

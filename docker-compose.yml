@@ -9,9 +9,11 @@ x-render-worker-common: &render-worker-common
     TILE_FS_PATH: /data/tiles
     RENDER_BACKEND: python-mapnik
     RENDER_WORKER_PROCESSES: "4"
-    METATILE_SIZE: "8"
+    RENDER_DB_MAX_ACTIVE: "6"
+    RENDER_DB_STATEMENT_TIMEOUT_MS: "30000"
+    METATILE_SIZE: "4"
     STORE_FULL_METATILE: "true"
-    WORKER_BATCH_SIZE: "32"
+    WORKER_BATCH_SIZE: "8"
   volumes:
     - tile-cache:/data/tiles
   depends_on:
@@ -72,6 +74,8 @@ services:
       TILE_FS_PATH: /data/tiles
       RENDER_BACKEND: python-mapnik
       RENDER_WORKER_PROCESSES: "4"
+      RENDER_DB_MAX_ACTIVE: "6"
+      RENDER_DB_STATEMENT_TIMEOUT_MS: "30000"
       ADMIN_ENABLED: "true"
       ADMIN_TOKEN: change-me
     volumes:

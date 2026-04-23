@@ -65,6 +65,28 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 AppConfig.from_env("render-worker")
 
+    def test_nearby_prefetch_settings_are_configurable(self):
+        env = {
+            "RENDER_DATABASE_URL": "postgresql://render:secret@postgres/gis",
+            "NEARBY_PREFETCH_ENABLED": "false",
+            "NEARBY_PREFETCH_RADIUS": "2",
+            "NEARBY_PREFETCH_PRIORITY": "275",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = AppConfig.from_env("tile-api")
+        self.assertFalse(config.nearby_prefetch_enabled)
+        self.assertEqual(config.nearby_prefetch_radius, 2)
+        self.assertEqual(config.nearby_prefetch_priority, 275)
+
+    def test_nearby_prefetch_rejects_invalid_values(self):
+        env = {
+            "RENDER_DATABASE_URL": "postgresql://render:secret@postgres/gis",
+            "NEARBY_PREFETCH_RADIUS": "-1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ConfigError):
+                AppConfig.from_env("tile-api")
+
     def test_http_sidecar_backend_requires_url(self):
         env = {
             "RENDER_DATABASE_URL": "postgresql://render:secret@postgres/gis",

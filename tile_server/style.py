@@ -42,7 +42,11 @@ def materialize_style_xml(config: AppConfig, bundle_uri: Optional[str] = None, l
             _copy_style_assets(source.parent, temp_dir)
             temp_target = temp_dir / f"mapnik-{layer}.xml"
             shutil.copyfile(source, temp_target)
-            patch_postgis_datasources(temp_target, config.render_database_url)
+            patch_postgis_datasources(
+                temp_target,
+                config.render_database_url,
+                statement_timeout_ms=config.render_db_statement_timeout_ms,
+            )
             try:
                 temp_dir.rename(target_dir)
             except FileExistsError:
@@ -219,10 +223,14 @@ def _style_path(root: Path, style: dict) -> Path:
     return root / style_dir / mapnik_xml
 
 
-def patch_postgis_datasources(xml_path: Path, database_url: Optional[str]) -> None:
+def patch_postgis_datasources(
+    xml_path: Path,
+    database_url: Optional[str],
+    statement_timeout_ms: int = 30000,
+) -> None:
     if not database_url:
         return
-    params = _postgres_params(database_url)
+    params = _postgres_params(database_url, statement_timeout_ms=statement_timeout_ms)
     if not params:
         return
 
@@ -243,7 +251,7 @@ def patch_postgis_datasources(xml_path: Path, database_url: Optional[str]) -> No
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
 
-def _postgres_params(database_url: str) -> dict[str, str]:
+def _postgres_params(database_url: str, statement_timeout_ms: int = 30000) -> dict[str, str]:
     if not (database_url.startswith("postgresql://") or database_url.startswith("postgres://")):
         return {}
     parsed = urllib.parse.urlparse(database_url)
@@ -260,6 +268,11 @@ def _postgres_params(database_url: str) -> dict[str, str]:
     query = urllib.parse.parse_qs(parsed.query)
     if "sslmode" in query:
         params["sslmode"] = query["sslmode"][0]
+    existing_options = query.get("options", [""])[0].strip()
+    options = [value for value in [existing_options, "-c default_transaction_read_only=on"] if value]
+    options.append(f"-c statement_timeout={max(1, int(statement_timeout_ms))}")
+    params["options"] = " ".join(options)
+    params["application_name"] = "opentilesx-render"
     return {key: value for key, value in params.items() if value}
 
 
