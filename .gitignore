@@ -25,6 +25,4 @@ data/tiles/
 *.tar.gz
 *.tgz
 *.zip
-
-*.png
 *.log
