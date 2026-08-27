@@ -25,6 +25,14 @@ from .tiles import TileRef
 LOGGER = logging.getLogger(__name__)
 WEB_MERCATOR_HALF_WORLD = 20037508.342789244
 
+try:
+    import mapnik
+except ImportError as exc:
+    mapnik = None
+    MAPNIK_IMPORT_ERROR = exc
+else:
+    MAPNIK_IMPORT_ERROR = None
+
 
 @dataclass(frozen=True)
 class RenderResult:
@@ -52,25 +60,17 @@ class PythonMapnikRenderBackend(RenderBackend):
         self._style_xml(layer)
 
     def render_tile(self, tile: TileRef) -> bytes:
-        try:
-            import mapnik
-        except ImportError as exc:
-            raise RenderError("python3-mapnik is required for render-worker") from exc
-
+        mapnik_module = _require_mapnik()
         size = 256
-        world = mapnik.Map(size, size)
-        mapnik.load_map(world, str(self._style_xml(tile.layer)))
-        world.zoom_to_box(_tile_box(tile, mapnik))
-        image = mapnik.Image(size, size)
-        mapnik.render(world, image)
+        world = mapnik_module.Map(size, size)
+        mapnik_module.load_map(world, str(self._style_xml(tile.layer)))
+        world.zoom_to_box(_tile_box(tile, mapnik_module))
+        image = mapnik_module.Image(size, size)
+        mapnik_module.render(world, image)
         return _image_to_png_bytes(image)
 
     def render_metatile(self, origin: TileRef, size: int = 8) -> dict[TileRef, bytes]:
-        try:
-            import mapnik
-        except ImportError as exc:
-            raise RenderError("python3-mapnik is required for render-worker") from exc
-
+        mapnik_module = _require_mapnik()
         rendered = {}
         max_coord = 1 << origin.z
         tiles_x = min(size, max_coord - origin.x)
@@ -79,11 +79,11 @@ class PythonMapnikRenderBackend(RenderBackend):
             return rendered
 
         tile_size = 256
-        world = mapnik.Map(tile_size * tiles_x, tile_size * tiles_y)
-        mapnik.load_map(world, str(self._style_xml(origin.layer)))
-        world.zoom_to_box(_metatile_box(origin, tiles_x, tiles_y, mapnik))
-        image = mapnik.Image(tile_size * tiles_x, tile_size * tiles_y)
-        mapnik.render(world, image)
+        world = mapnik_module.Map(tile_size * tiles_x, tile_size * tiles_y)
+        mapnik_module.load_map(world, str(self._style_xml(origin.layer)))
+        world.zoom_to_box(_metatile_box(origin, tiles_x, tiles_y, mapnik_module))
+        image = mapnik_module.Image(tile_size * tiles_x, tile_size * tiles_y)
+        mapnik_module.render(world, image)
 
         for dx in range(tiles_x):
             for dy in range(tiles_y):
@@ -148,6 +148,12 @@ def build_render_backend(config: AppConfig) -> RenderBackend:
     if config.render_backend == "http-sidecar":
         return HttpSidecarRenderBackend(config)
     raise RenderError(f"Unsupported render backend: {config.render_backend}")
+
+
+def _require_mapnik() -> object:
+    if mapnik is None:
+        raise RenderError("python3-mapnik is required for render-worker") from MAPNIK_IMPORT_ERROR
+    return mapnik
 
 
 class RenderWorker:

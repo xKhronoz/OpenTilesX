@@ -187,6 +187,18 @@ When enabled, the browser control panel is available at `/admin`. It is self-con
 
 The offline map preview is available at `/map`. It uses no Leaflet, CDN, or third-party browser library; it only requests this server's `/tile/...png` endpoints so operators can test loaded tiles in isolated environments.
 
+### Frontend Image Source Sync
+
+Runtime image and favicon URLs remain under `/static/images` and are served from `tile_server/static/images`.
+
+For frontend authoring convenience, source images can be edited under `frontend/app/assets/images` and synced into the runtime static path:
+
+```sh
+npm run sync:images
+```
+
+`npm run build:app` runs this sync automatically via `prebuild:app`.
+
 Render performance defaults favor cached map browsing:
 
 ```sh

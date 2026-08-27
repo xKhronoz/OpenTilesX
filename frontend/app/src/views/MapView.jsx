@@ -1,4 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import RefreshMeter from "../components/RefreshMeter.jsx";
+import openTilesLogo from "../../assets/images/OpenTilesX.svg";
+import { appPath } from "../utils/routes.js";
 
 const TILE_SIZE = 256;
 const MAX_ZOOM = 22;
@@ -43,7 +46,7 @@ function centerTile(z, offsetX, offsetY, viewportSize) {
 function initialTileState(reloadToken) {
   return {
     status: "loading",
-    title: "Loading tile",
+    title: "Loading Tile",
     detail: "Requesting PNG or render queue status.",
     attempts: 0,
     objectUrl: "",
@@ -177,7 +180,7 @@ export default function MapView() {
       revokeTileUrl(key);
       updateTileState(key, {
         status: "loading",
-        title: "Loading tile",
+        title: "Loading Tile",
         detail: `Attempt ${attempts + 1} for ${descriptor.z}/${descriptor.x}/${descriptor.y}.`,
         attempts: attempts + 1,
         objectUrl: "",
@@ -203,7 +206,7 @@ export default function MapView() {
           return;
         }
         if (response.status === 202) {
-          let title = "Queued for rendering";
+          let title = "Queued For Rendering";
           try {
             const payload = await response.json();
             if (payload.status) title = `${payload.status} for rendering`;
@@ -221,7 +224,7 @@ export default function MapView() {
           updateTileState(key, {
             status: "queued",
             title,
-            detail: `Retrying in ${retrySeconds}s. Import, render workers, and shared tile storage must be healthy.`,
+            detail: `Retrying In ${retrySeconds}s. Import, render workers, and shared tile storage must be healthy.`,
             reloadToken,
           });
           const timer = window.setTimeout(() => {
@@ -234,7 +237,7 @@ export default function MapView() {
         updateTileState(key, {
           status: "error",
           title: `HTTP ${response.status}`,
-          detail: "Tile request failed. Check API, storage, and renderer diagnostics.",
+          detail: "Tile Request Failed. Check API, storage, and renderer diagnostics.",
           reloadToken,
         });
       } catch (error) {
@@ -301,9 +304,11 @@ export default function MapView() {
 
   const statusText = useMemo(
     () =>
-      `Layer ${layer} around ${z}/${center.x}/${center.y}. ${counts.ready} ready, ${counts.queued} queued, ${counts.error} error, ${counts.loading} loading.`,
+      `Layer ${layer} Around ${z}/${center.x}/${center.y}. ${counts.ready} Ready, ${counts.queued} Queued, ${counts.error} Error, ${counts.loading} Loading.`,
     [center.x, center.y, counts.error, counts.loading, counts.queued, counts.ready, layer, z],
   );
+
+  const tileRefreshActive = counts.loading > 0 || counts.queued > 0;
 
   const zoomBy = useCallback(
     (delta, anchorX = null, anchorY = null) => {
@@ -437,15 +442,19 @@ export default function MapView() {
   return (
     <div className="map-route">
       <header className="map-bar">
-        <div>
-          <p className="eyebrow">OpenTilesX</p>
-          <h1>Map Preview</h1>
+        <div className="map-bar-inner">
+          <a className="map-brand brand-link" href={appPath("/")}>
+            <img className="map-header-logo" src={openTilesLogo} alt="OpenTilesX" />
+            <div>
+              <h1>OpenTilesX</h1>
+              <p className="eyebrow">Map Preview</p>
+            </div>
+          </a>
+          <nav className="map-header-actions" aria-label="Map navigation">
+            <a href={appPath("/")}>Home</a>
+            <a href={appPath("/admin")}>Admin</a>
+          </nav>
         </div>
-          <div className="map-header-actions">
-            <img className="map-header-logo" src="/static/images/OpenTilesX.svg" alt="" />
-            <a href="/">Home</a>
-            <a href="/admin">Admin</a>
-          </div>
       </header>
 
       <main className="map-layout">
@@ -472,25 +481,36 @@ export default function MapView() {
           </div>
 
           <div className="button-grid">
-            <button onClick={() => zoomBy(-1)}>Zoom out</button>
-            <button onClick={() => zoomBy(1)}>Zoom in</button>
+            <button onClick={() => zoomBy(-1)}>Zoom Out</button>
+            <button onClick={() => zoomBy(1)}>Zoom In</button>
             <button onClick={resetWorld}>World</button>
-            <button onClick={reloadTiles}>Reload tiles</button>
+            <button onClick={reloadTiles}>Reload Tiles</button>
             <button className="secondary" onClick={retryQueuedTiles}>
-              Retry queued
+              Retry Queued
             </button>
+          </div>
+
+          <div className="mt-4">
+            <RefreshMeter
+              label="Tile Refresh"
+              detail={tileRefreshActive ? "Fetching Visible Tiles And Retrying Queued Work" : "Ready For Manual Reload"}
+              loading={counts.loading > 0}
+              active={tileRefreshActive && counts.loading === 0}
+              cycleMs={6000}
+              activeLabel="Retry Scheduled"
+            />
           </div>
 
           <p>Drag to pan. Use the mouse wheel or touch gestures to zoom. Only this server&apos;s tile endpoints are loaded.</p>
           <div className="status-counters" aria-label="Visible tile status">
             <span className="count-pill ready">
-              ready: <strong>{counts.ready}</strong>
+              Ready: <strong>{counts.ready}</strong>
             </span>
             <span className="count-pill queued">
-              queued: <strong>{counts.queued}</strong>
+              Queued: <strong>{counts.queued}</strong>
             </span>
             <span className="count-pill error">
-              error: <strong>{counts.error}</strong>
+              Error: <strong>{counts.error}</strong>
             </span>
           </div>
           <p className="hint">

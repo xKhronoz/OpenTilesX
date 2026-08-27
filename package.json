@@ -2,6 +2,8 @@
   "name": "opentilesx-web-ui",
   "private": true,
   "scripts": {
+    "sync:images": "node scripts/sync_frontend_images.mjs",
+    "prebuild:app": "npm run sync:images",
     "build:app": "vite build --config frontend/app/vite.config.js"
   },
   "dependencies": {
@@ -9,7 +11,9 @@
     "react-dom": "^19.2.5"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.2.4",
     "@vitejs/plugin-react": "^6.0.1",
+    "tailwindcss": "^4.2.4",
     "vite": "^8.0.9"
   }
 }

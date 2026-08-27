@@ -1,4 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
+import RefreshMeter from "../components/RefreshMeter.jsx";
+import openTilesLogo from "../../assets/images/OpenTilesX.svg";
+import { appPath } from "../utils/routes.js";
 
 const descriptions = {
   import:
@@ -170,12 +173,20 @@ const tabs = [
   ["examples", "Examples"],
 ];
 
+const ADMIN_ACTIVE_TAB_KEY = "tileAdminActiveTab";
+
 function pretty(value) {
   return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
 function healthClass(status) {
   return status || "unknown";
+}
+
+function titleCaseWords(value) {
+  return String(value || "unknown")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function isRemoteUri(value) {
@@ -439,10 +450,18 @@ function TrashIcon() {
 export default function AdminView() {
   const [token, setToken] = useState(localStorage.getItem("tileAdminToken") || "");
   const [draftToken, setDraftToken] = useState(localStorage.getItem("tileAdminToken") || "");
-  const [activeTab, setActiveTab] = useState("dashboard");
+  const [activeTab, setActiveTab] = useState(() => {
+    const savedTab = localStorage.getItem(ADMIN_ACTIVE_TAB_KEY);
+    const hasSavedTab = tabs.some(([value]) => value === savedTab);
+    return hasSavedTab ? savedTab : "dashboard";
+  });
   const [capabilities, setCapabilities] = useState(null);
   const [health, setHealth] = useState("Not loaded.");
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthUpdatedAt, setHealthUpdatedAt] = useState(null);
   const [jobs, setJobs] = useState([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobsUpdatedAt, setJobsUpdatedAt] = useState(null);
   const [statusFilter, setStatusFilter] = useState("");
   const [jobLookup, setJobLookup] = useState("");
   const [jobDetails, setJobDetails] = useState("Open a job to inspect payload, result, and errors.");
@@ -465,6 +484,8 @@ export default function AdminView() {
   const [bundleValidateOutput, setBundleValidateOutput] = useState("Ready.");
   const [bundleUpload, setBundleUpload] = useState(null);
   const [diagnostics, setDiagnostics] = useState(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [diagnosticsUpdatedAt, setDiagnosticsUpdatedAt] = useState(null);
   const [diagnosticsOutput, setDiagnosticsOutput] = useState("Ready.");
   const [diagnosticTile, setDiagnosticTile] = useState({ layer: "default", z: 0, x: 0, y: 0 });
   const [failuresLimit, setFailuresLimit] = useState(20);
@@ -484,6 +505,15 @@ export default function AdminView() {
     return gateForPayload(kind, parsedPayload.value, capabilities);
   }, [kind, parsedPayload, capabilities]);
 
+  const createDisabledReason =
+    !token
+      ? "Save an admin token to create jobs."
+      : parsedPayload.error
+        ? `Fix payload JSON before creating a job: ${parsedPayload.error}`
+        : createGate.blocked
+          ? createGate.reason
+          : "";
+
   function addToast(message, type = "ok", detail = "") {
     const id = crypto.randomUUID();
     setToasts((items) => [...items, { id, message, type, detail }]);
@@ -497,12 +527,27 @@ export default function AdminView() {
   }
 
   async function loadHealth() {
+    setHealthLoading(true);
     try {
       const response = await fetch("/healthz");
-      const data = await response.json();
-      setHealth(pretty(data));
+      const contentType = response.headers.get("content-type") || "";
+      const body = contentType.includes("application/json") ? await response.json() : await response.text();
+      if (!response.ok) {
+        const detail = typeof body === "string" ? body : pretty(body);
+        setHealth(`Health request failed (${response.status}).\n${detail}`);
+        return;
+      }
+      if (typeof body === "string") {
+        setHealth(`Health endpoint returned a non-JSON response.\n${body}`);
+        setHealthUpdatedAt(Date.now());
+        return;
+      }
+      setHealth(pretty(body));
+      setHealthUpdatedAt(Date.now());
     } catch (error) {
       setHealth(String(error));
+    } finally {
+      setHealthLoading(false);
     }
   }
 
@@ -522,14 +567,18 @@ export default function AdminView() {
 
   async function loadJobs() {
     if (!token) return;
+    setJobsLoading(true);
     try {
       const query =
         "/admin/jobs?limit=50" + (statusFilter ? `&status=${encodeURIComponent(statusFilter)}` : "");
       const data = await api(query, token);
       setJobs(data.jobs || []);
+      setJobsUpdatedAt(Date.now());
     } catch (error) {
       setJobDetails(pretty(error));
       addToast("Could not load jobs", "error", "Check the admin token and metadata database connection.");
+    } finally {
+      setJobsLoading(false);
     }
   }
 
@@ -563,15 +612,19 @@ export default function AdminView() {
 
   async function loadDiagnostics() {
     if (!token) return;
+    setDiagnosticsLoading(true);
     try {
       const data = await api(
         `/admin/diagnostics?failures_limit=${encodeURIComponent(failuresLimit)}`,
         token,
       );
       setDiagnostics(data);
+      setDiagnosticsUpdatedAt(Date.now());
     } catch (error) {
       setDiagnosticsOutput(pretty(error));
       addToast("Diagnostics failed", "error", "Check the admin token and metadata database connection.");
+    } finally {
+      setDiagnosticsLoading(false);
     }
   }
 
@@ -586,6 +639,28 @@ export default function AdminView() {
   }, [token]);
 
   useEffect(() => {
+    if (activeTab === "dashboard") {
+      loadHealth();
+      loadJobs();
+      const interval = window.setInterval(() => {
+        if (!document.hidden) {
+          loadHealth();
+          loadJobs();
+        }
+      }, 30000);
+      return () => window.clearInterval(interval);
+    }
+    if (activeTab === "jobs") {
+      loadJobs();
+      const interval = window.setInterval(() => {
+        if (!document.hidden) loadJobs();
+      }, 20000);
+      return () => window.clearInterval(interval);
+    }
+    return undefined;
+  }, [activeTab, statusFilter, token]);
+
+  useEffect(() => {
     if (activeTab !== "diagnostics" || !token) return undefined;
     loadDiagnostics();
     const interval = window.setInterval(() => {
@@ -597,6 +672,10 @@ export default function AdminView() {
   useEffect(() => {
     if (token) loadJobs();
   }, [statusFilter]);
+
+  useEffect(() => {
+    localStorage.setItem(ADMIN_ACTIVE_TAB_KEY, activeTab);
+  }, [activeTab]);
 
   function saveToken() {
     localStorage.setItem("tileAdminToken", draftToken);
@@ -663,13 +742,13 @@ export default function AdminView() {
   return (
     <div className="admin-shell">
       <aside className="sidebar">
-        <div className="brand">
-          <img src="/static/images/OpenTilesX.svg" alt="" />
+        <a className="brand brand-link" href={appPath("/")}>
+          <img src={openTilesLogo} alt="" />
           <div>
             <h1>OpenTilesX</h1>
-            <p>Admin control plane</p>
+            <p className="eyebrow">Admin Control Plane</p>
           </div>
-        </div>
+        </a>
 
         <form
           className="token-form"
@@ -678,7 +757,7 @@ export default function AdminView() {
             saveToken();
           }}
         >
-          <label htmlFor="token">Admin token</label>
+          <label htmlFor="token">Admin Token</label>
           <input
             id="token"
             type="password"
@@ -687,7 +766,7 @@ export default function AdminView() {
             placeholder="ADMIN_TOKEN"
           />
           <button className="full" type="submit">
-            Save token
+            Save Token
           </button>
         </form>
 
@@ -703,8 +782,12 @@ export default function AdminView() {
           ))}
         </nav>
 
-        <a className="map-link" href="/map">
-          Open map preview
+        <a className="home-link" href={appPath("/")}>
+          Home
+        </a>
+
+        <a className="map-link" href={appPath("/map")}>
+          Open Map
         </a>
       </aside>
 
@@ -731,20 +814,20 @@ export default function AdminView() {
                   <dl className="facts">
                     <div>
                       <dt>Token</dt>
-                      <dd>{token ? "saved" : "missing"}</dd>
+                      <dd>{token ? "Saved" : "Missing"}</dd>
                     </div>
                     <div>
-                      <dt>External data mode</dt>
-                      <dd>{capabilities?.external_data?.default_mode || "unknown"}</dd>
+                      <dt>External Data Mode</dt>
+                      <dd>{titleCaseWords(capabilities?.external_data?.default_mode || "unknown")}</dd>
                     </div>
                     <div>
-                      <dt>Fetch policy</dt>
+                      <dt>Fetch Policy</dt>
                       <dd>
                         {capabilities
-                          ? `${capabilities.external_data.allow_internal_downloads ? "internal on" : "internal off"} / ${
-                              capabilities.external_data.allow_public_downloads ? "public on" : "public off"
+                          ? `${capabilities.external_data.allow_internal_downloads ? "Internal On" : "Internal Off"} / ${
+                              capabilities.external_data.allow_public_downloads ? "Public On" : "Public Off"
                             }`
-                          : "unknown"}
+                          : "Unknown"}
                       </dd>
                     </div>
                   </dl>
@@ -759,7 +842,7 @@ export default function AdminView() {
                       }, {}),
                     ).map(([status, count]) => (
                       <span key={status} className={`count-pill ${status}`}>
-                        {status}: {count}
+                        {titleCaseWords(status)}: {count}
                       </span>
                     ))}
                   </div>
@@ -772,17 +855,31 @@ export default function AdminView() {
                   Tiles appear after data is imported, the render worker consumes dirty tile records, and the API finds cached
                   PNGs in the shared filesystem or S3 tile store.
                 </p>
+                <div className="mt-4">
+                  <RefreshMeter
+                    label="Dashboard Refresh"
+                    detail={
+                      healthLoading || jobsLoading
+                        ? "Refreshing Health And Job Data"
+                        : "Auto-Refresh Every 30 Seconds"
+                    }
+                    loading={healthLoading || jobsLoading}
+                    active={!(healthLoading || jobsLoading)}
+                    cycleMs={30000}
+                    lastUpdatedAt={Math.max(healthUpdatedAt || 0, jobsUpdatedAt || 0) || null}
+                  />
+                </div>
                 <div className="button-row">
-                  <button onClick={() => setActiveTab("create")}>Create import job</button>
+                  <button onClick={() => setActiveTab("create")}>Create Import Job</button>
                   <button className="secondary" onClick={() => setActiveTab("jobs")}>
-                    View jobs
+                    View Jobs
                   </button>
                   <button className="quiet" onClick={() => setActiveTab("bundles")}>
-                    Validate bundle
+                    Validate Bundle
                   </button>
                   <button className="quiet with-icon" onClick={loadHealth}>
                     <RefreshIcon />
-                    <span>Refresh dashboard</span>
+                    <span>Refresh Dashboard</span>
                   </button>
                 </div>
               </section>
@@ -797,9 +894,9 @@ export default function AdminView() {
                   <p>Search recent admin work without letting long ids or errors stretch the page sideways.</p>
                 </div>
                 <div className="toolbar">
-                  <input value={jobLookup} onChange={(event) => setJobLookup(event.target.value)} placeholder="Paste a job id" />
+                  <input value={jobLookup} onChange={(event) => setJobLookup(event.target.value)} placeholder="Enter a Job ID" />
                   <button className="secondary" onClick={() => openJob(jobLookup)}>
-                    Open job
+                    Open Job
                   </button>
                   <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
                     <option value="">All</option>
@@ -831,25 +928,39 @@ export default function AdminView() {
                     }}
                   >
                     <TrashIcon />
-                    <span>Clear history</span>
+                    <span>Clear History</span>
                   </button>
                 </div>
+              </div>
+              <div className="mt-4 mb-4">
+                <RefreshMeter
+                  label="Jobs Refresh"
+                  detail={
+                    jobsLoading
+                      ? "Fetching The Latest Jobs"
+                      : "Auto-Refresh Every 20 Seconds While This Tab Is Open"
+                  }
+                  loading={jobsLoading}
+                  active={!jobsLoading}
+                  cycleMs={20000}
+                  lastUpdatedAt={jobsUpdatedAt}
+                />
               </div>
               <div className="table-scroll">
                 <table className="jobs-table">
                   <thead>
                     <tr>
-                      <th>id</th>
-                      <th>kind</th>
-                      <th>status</th>
-                      <th>created</th>
-                      <th>error</th>
+                      <th>ID</th>
+                      <th>Kind</th>
+                      <th>Status</th>
+                      <th>Created</th>
+                      <th>Error</th>
                     </tr>
                   </thead>
                   <tbody>
                     {jobs.length === 0 && (
                       <tr>
-                        <td colSpan="5">No jobs found.</td>
+                        <td colSpan="5">No Jobs Found.</td>
                       </tr>
                     )}
                     {jobs.map((job) => (
@@ -875,7 +986,7 @@ export default function AdminView() {
                         </td>
                         <td>{job.kind}</td>
                         <td>
-                          <span className={`status ${healthClass(job.status)}`}>{job.status}</span>
+                          <span className={`status ${healthClass(job.status)}`}>{titleCaseWords(job.status)}</span>
                         </td>
                         <td>{job.created_at}</td>
                         <td>{job.error}</td>
@@ -895,7 +1006,7 @@ export default function AdminView() {
             <section className="page-grid">
               <article className="panel">
                 <h3>Create Job</h3>
-                <label htmlFor="kind">Job kind</label>
+                <label htmlFor="kind">Job Kind</label>
                 <select
                   id="kind"
                   value={kind}
@@ -913,7 +1024,6 @@ export default function AdminView() {
                     {capabilities.external_data.default_mode_message}
                   </p>
                 )}
-                {createGate.blocked && <p className="gate-message blocked">{createGate.reason}</p>}
                 <label htmlFor="payload">Payload JSON</label>
                 <textarea
                   id="payload"
@@ -925,9 +1035,10 @@ export default function AdminView() {
                 <div className="button-row">
                   <button
                     disabled={!token || !!parsedPayload.error || createGate.blocked}
+                    title={createDisabledReason || undefined}
                     onClick={() => createJob(endpoints[kind], parsedPayload.value || {}, setCreateOutput, kind)}
                   >
-                    Create job
+                    Create Job
                   </button>
                   <button className="quiet" onClick={formatPayload}>
                     Format JSON
@@ -948,7 +1059,6 @@ export default function AdminView() {
                 <article className="panel">
                   <h3>Bundle Generator</h3>
                   <p>Build a portable archive for airgap activation from a prepared style directory and optional import files.</p>
-                  {bundleGate.blocked && <p className="gate-message blocked">{bundleGate.reason}</p>}
                   <div className="split">
                     <div>
                       <label>Name</label>
@@ -1000,6 +1110,13 @@ export default function AdminView() {
                     </button>
                     <button
                       disabled={!token || bundleGate.blocked}
+                      title={
+                        !token
+                          ? "Save an admin token to generate bundles."
+                          : bundleGate.blocked
+                            ? bundleGate.reason
+                            : undefined
+                      }
                       onClick={() => createJob(endpoints["map-bundle/generate"], bundlePayload(), setBundleGenerateOutput, "map-bundle/generate")}
                     >
                       Generate bundle
@@ -1020,9 +1137,10 @@ export default function AdminView() {
                   <div className="button-row">
                     <button
                       disabled={!token}
+                      title={!token ? "Save an admin token to validate bundles." : undefined}
                       onClick={() => createJob(endpoints["map-bundle/validate"], { map_bundle_uri: bundleValidateUri }, setBundleValidateOutput, "map-bundle/validate")}
                     >
-                      Validate mounted bundle
+                      Validate Mounted Bundle
                     </button>
                   </div>
                   <div className="divider" />
@@ -1033,6 +1151,13 @@ export default function AdminView() {
                     <button
                       className="secondary"
                       disabled={!token || !bundleUpload}
+                      title={
+                        !token
+                          ? "Save an admin token to upload and validate bundles."
+                          : !bundleUpload
+                            ? "Choose a bundle archive first."
+                            : undefined
+                      }
                       onClick={async () => {
                         const form = new FormData();
                         form.append("bundle", bundleUpload);
@@ -1051,7 +1176,7 @@ export default function AdminView() {
                         }
                       }}
                     >
-                      Upload and validate
+                      Upload And Validate
                     </button>
                   </div>
                 </article>
@@ -1098,9 +1223,23 @@ export default function AdminView() {
                     }}
                   >
                     <TrashIcon />
-                    <span>Clear diagnostics</span>
+                    <span>Clear Diagnostics</span>
                   </button>
                 </div>
+              </div>
+              <div className="mb-4">
+                <RefreshMeter
+                  label="Diagnostics Refresh"
+                  detail={
+                    diagnosticsLoading
+                      ? "Refreshing Live Worker And Queue Data"
+                      : "Auto-Refresh Every 10 Seconds"
+                  }
+                  loading={diagnosticsLoading}
+                  active={!diagnosticsLoading}
+                  cycleMs={10000}
+                  lastUpdatedAt={diagnosticsUpdatedAt}
+                />
               </div>
 
               <div className="cards">
@@ -1130,7 +1269,7 @@ export default function AdminView() {
                   <div className="status-counts">
                     {["pending", "leased", "done", "failed"].map((status) => (
                       <span key={status} className={`count-pill ${status}`}>
-                        {status}: {diagnostics?.dirty_tiles?.counts?.[status] || 0}
+                        {titleCaseWords(status)}: {diagnostics?.dirty_tiles?.counts?.[status] || 0}
                       </span>
                     ))}
                   </div>
@@ -1154,23 +1293,23 @@ export default function AdminView() {
                     <table className="workers-table">
                       <thead>
                         <tr>
-                          <th>worker</th>
-                          <th>health</th>
-                          <th>state</th>
-                          <th>processed</th>
-                          <th>timings</th>
-                          <th>last seen</th>
-                          <th>error</th>
+                          <th>Worker</th>
+                          <th>Health</th>
+                          <th>State</th>
+                          <th>Processed</th>
+                          <th>Timings</th>
+                          <th>Last Seen</th>
+                          <th>Error</th>
                         </tr>
                       </thead>
                       <tbody>
                         {(diagnostics?.render_workers || []).map((worker) => (
                           <tr key={worker.worker_id || worker.hostname}>
                             <td>{worker.worker_id || worker.hostname}</td>
-                            <td>{worker.health}</td>
-                            <td>{worker.state}</td>
+                            <td>{titleCaseWords(worker.health)}</td>
+                            <td>{titleCaseWords(worker.state)}</td>
                             <td>{worker.processed_count}</td>
-                            <td>render {worker.last_render_seconds || 0}s | store {worker.last_store_seconds || 0}s</td>
+                            <td>Render {worker.last_render_seconds || 0}s | Store {worker.last_store_seconds || 0}s</td>
                             <td>{worker.last_seen}</td>
                             <td>{worker.last_error}</td>
                           </tr>
@@ -1181,10 +1320,9 @@ export default function AdminView() {
                 </article>
 
                 <article className="panel fixed-panel">
-                  <div className="panel-title-row">
+                  <div className="panel-title-row mb-4">
                     <h3>Recent Failed Tiles</h3>
                     <div className="toolbar compact">
-                      <label className="inline-label">Show</label>
                       <select value={failuresLimit} onChange={(event) => setFailuresLimit(Number(event.target.value))}>
                         <option value="10">10</option>
                         <option value="20">20</option>
@@ -1197,10 +1335,10 @@ export default function AdminView() {
                     <table className="failures-table">
                       <thead>
                         <tr>
-                          <th>tile</th>
-                          <th>attempts</th>
-                          <th>updated</th>
-                          <th>error</th>
+                          <th>Tile</th>
+                          <th>Attempts</th>
+                          <th>Updated</th>
+                          <th>Error</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1286,12 +1424,15 @@ export default function AdminView() {
                       <article key={key} className="example-card">
                         <h4>{example.title}</h4>
                         <p>{example.description}</p>
-                        {gate.blocked && <p className="example-badge">{gate.reason}</p>}
                         <div className="button-row">
                           <button className="secondary" onClick={() => previewExample(example)}>
                             Preview
                           </button>
-                          <button disabled={gate.blocked} onClick={() => loadExample(example)}>
+                          <button
+                            disabled={gate.blocked}
+                            title={gate.blocked ? gate.reason : undefined}
+                            onClick={() => loadExample(example)}
+                          >
                             Load into form
                           </button>
                         </div>

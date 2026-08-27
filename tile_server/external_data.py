@@ -11,6 +11,24 @@ from typing import Any, Optional
 
 from .config import AppConfig, mask_secret
 
+try:
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+except ImportError as exc:
+    boto3 = None
+    BotocoreConfig = None
+    BOTO3_IMPORT_ERROR = exc
+else:
+    BOTO3_IMPORT_ERROR = None
+
+try:
+    import yaml
+except ImportError as exc:
+    yaml = None
+    YAML_IMPORT_ERROR = exc
+else:
+    YAML_IMPORT_ERROR = None
+
 
 ARCHIVE_SUFFIXES = (".zip", ".tar", ".tgz", ".tar.gz")
 
@@ -296,11 +314,8 @@ class ExternalDataManager:
     def _download_s3(self, parsed: urllib.parse.ParseResult, target: Path) -> None:
         if not self.config.s3:
             raise ExternalDataError("S3/OCI external-data downloads require S3_* configuration")
-        try:
-            import boto3
-            from botocore.config import Config
-        except ImportError as exc:
-            raise ExternalDataError("boto3 is required for s3:// and oci:// external-data downloads") from exc
+        if boto3 is None or BotocoreConfig is None:
+            raise ExternalDataError("boto3 is required for s3:// and oci:// external-data downloads") from BOTO3_IMPORT_ERROR
         bucket = parsed.netloc or self.config.s3.bucket
         key = parsed.path.lstrip("/")
         if not bucket or not key:
@@ -312,7 +327,7 @@ class ExternalDataManager:
             endpoint_url=self.config.s3.endpoint_url,
             aws_access_key_id=self.config.s3.access_key_id,
             aws_secret_access_key=self.config.s3.secret_access_key,
-            config=Config(signature_version="s3v4", **options),
+            config=BotocoreConfig(signature_version="s3v4", **options),
         )
         client.download_file(bucket, key, str(target))
 
@@ -412,9 +427,7 @@ def _mask_command(command: list[str]) -> list[str]:
 
 
 def _load_yaml(text: str, path: Path) -> Any:
-    try:
-        import yaml
-    except ImportError:
+    if yaml is None:
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
@@ -423,8 +436,6 @@ def _load_yaml(text: str, path: Path) -> Any:
 
 
 def _dump_yaml(data: dict[str, Any]) -> str:
-    try:
-        import yaml
-    except ImportError:
+    if yaml is None:
         return json.dumps(data, indent=2)
     return yaml.safe_dump(data, sort_keys=False)

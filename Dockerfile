@@ -125,6 +125,7 @@ COPY package.json package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
   npm ci
 
+COPY scripts scripts
 COPY frontend/app frontend/app
 
 RUN npm run build:app

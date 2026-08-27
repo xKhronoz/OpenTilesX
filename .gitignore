@@ -26,3 +26,5 @@ data/tiles/
 *.tgz
 *.zip
 *.log
+
+tile_server/static/images/

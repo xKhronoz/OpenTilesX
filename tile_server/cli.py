@@ -16,7 +16,7 @@ from pathlib import Path
 from .api import run_server
 from .bundle_generator import generate_map_bundle
 from .bundles import MapBundleValidator
-from .config import AppConfig, ConfigError
+from .config import AppConfig, ConfigError, mask_secret
 from .external_data import ExternalDataManager
 from .imports import ImportInputResolver
 from .jobs import CommandBuilder, JobRunner, JobStore
@@ -131,8 +131,6 @@ def _configure_logging() -> None:
 
 
 def _masked_database(value: str | None) -> str:
-    from .config import mask_secret
-
     return mask_secret(value)
 
 

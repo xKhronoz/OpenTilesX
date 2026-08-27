@@ -10,6 +10,16 @@ from typing import Any, Optional
 
 from .config import AppConfig
 
+try:
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+except ImportError as exc:
+    boto3 = None
+    BotocoreConfig = None
+    BOTO3_IMPORT_ERROR = exc
+else:
+    BOTO3_IMPORT_ERROR = None
+
 
 @dataclass(frozen=True)
 class ResolvedInput:
@@ -129,11 +139,8 @@ class ImportInputResolver:
     def _download_s3(self, parsed: urllib.parse.ParseResult, target: Path) -> None:
         if not self.config.s3:
             raise ImportInputError("S3/OCI import inputs require S3_* configuration")
-        try:
-            import boto3
-            from botocore.config import Config
-        except ImportError as exc:
-            raise ImportInputError("boto3 is required for s3:// and oci:// import inputs") from exc
+        if boto3 is None or BotocoreConfig is None:
+            raise ImportInputError("boto3 is required for s3:// and oci:// import inputs") from BOTO3_IMPORT_ERROR
 
         bucket = parsed.netloc or self.config.s3.bucket
         key = parsed.path.lstrip("/")
@@ -146,7 +153,7 @@ class ImportInputResolver:
             endpoint_url=self.config.s3.endpoint_url,
             aws_access_key_id=self.config.s3.access_key_id,
             aws_secret_access_key=self.config.s3.secret_access_key,
-            config=Config(signature_version="s3v4", **options),
+            config=BotocoreConfig(signature_version="s3v4", **options),
         )
         client.download_file(bucket, key, str(target))
 

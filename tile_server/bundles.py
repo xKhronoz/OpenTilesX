@@ -13,6 +13,24 @@ from typing import Any, Optional
 
 from .config import AppConfig
 
+try:
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+except ImportError as exc:
+    boto3 = None
+    BotocoreConfig = None
+    BOTO3_IMPORT_ERROR = exc
+else:
+    BOTO3_IMPORT_ERROR = None
+
+try:
+    import yaml
+except ImportError as exc:
+    yaml = None
+    YAML_IMPORT_ERROR = exc
+else:
+    YAML_IMPORT_ERROR = None
+
 
 MANIFEST_NAMES = ("map-bundle.yaml", "map-bundle.yml", "manifest.yaml", "manifest.yml", "manifest.json")
 
@@ -67,11 +85,8 @@ class BundleResolver:
     def _download_s3(self, parsed: urllib.parse.ParseResult) -> Path:
         if not self.config.s3:
             raise BundleError("S3/OCI bundle URIs require S3_* configuration")
-        try:
-            import boto3
-            from botocore.config import Config
-        except ImportError as exc:
-            raise BundleError("boto3 is required for s3:// and oci:// bundle URIs") from exc
+        if boto3 is None or BotocoreConfig is None:
+            raise BundleError("boto3 is required for s3:// and oci:// bundle URIs") from BOTO3_IMPORT_ERROR
 
         bucket = parsed.netloc or self.config.s3.bucket
         key = parsed.path.lstrip("/")
@@ -85,7 +100,7 @@ class BundleResolver:
             endpoint_url=self.config.s3.endpoint_url,
             aws_access_key_id=self.config.s3.access_key_id,
             aws_secret_access_key=self.config.s3.secret_access_key,
-            config=Config(signature_version="s3v4", **options),
+            config=BotocoreConfig(signature_version="s3v4", **options),
         )
         fd, target = tempfile.mkstemp(prefix="map-bundle-", suffix=Path(key).suffix or ".bundle")
         os.close(fd)
@@ -141,10 +156,8 @@ class MapBundleValidator:
     def _load_manifest(self, path: Path) -> dict[str, Any]:
         if path.suffix == ".json":
             return json.loads(path.read_text())
-        try:
-            import yaml
-        except ImportError as exc:
-            raise BundleError("pyyaml is required to read YAML map bundles") from exc
+        if yaml is None:
+            raise BundleError("pyyaml is required to read YAML map bundles") from YAML_IMPORT_ERROR
         data = yaml.safe_load(path.read_text())
         if not isinstance(data, dict):
             raise BundleError("Bundle manifest must be an object")

@@ -18,6 +18,14 @@ from .external_data import ExternalDataManager
 from .imports import ImportInputResolver
 from .tiles import TileRef, metatile_origin
 
+try:
+    import psycopg2
+except ImportError as exc:
+    psycopg2 = None
+    PSYCOPG2_IMPORT_ERROR = exc
+else:
+    PSYCOPG2_IMPORT_ERROR = None
+
 
 SCHEMA_SQL = """
 CREATE SCHEMA IF NOT EXISTS tile_admin;
@@ -178,12 +186,8 @@ class JobStore:
 
     @contextmanager
     def connect(self) -> Iterator[Any]:
-        try:
-            import psycopg2
-            import psycopg2.extras
-        except ImportError as exc:
-            raise JobError("psycopg2 is required for database-backed jobs") from exc
-
+        if psycopg2 is None:
+            raise JobError("psycopg2 is required for database-backed jobs") from PSYCOPG2_IMPORT_ERROR
         conn = psycopg2.connect(self.database_url)
         try:
             yield conn

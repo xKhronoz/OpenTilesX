@@ -9,6 +9,18 @@ from typing import Optional
 from .config import AppConfig
 from .tiles import TileRef, tile_key
 
+try:
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+    from botocore.exceptions import ClientError as S3ClientError
+except ImportError as exc:
+    boto3 = None
+    BotocoreConfig = None
+    S3ClientError = None
+    BOTO3_IMPORT_ERROR = exc
+else:
+    BOTO3_IMPORT_ERROR = None
+
 
 @dataclass(frozen=True)
 class TileObject:
@@ -100,14 +112,10 @@ class S3TileStorage(TileStorage):
     def __init__(self, config: AppConfig) -> None:
         if not config.s3:
             raise StorageError("S3 configuration is missing")
-        try:
-            import boto3
-            from botocore.config import Config
-            from botocore.exceptions import ClientError
-        except ImportError as exc:
-            raise StorageError("boto3 is required when TILE_STORE=s3") from exc
+        if boto3 is None or BotocoreConfig is None or S3ClientError is None:
+            raise StorageError("boto3 is required when TILE_STORE=s3") from BOTO3_IMPORT_ERROR
 
-        self._client_error = ClientError
+        self._client_error = S3ClientError
         self.bucket = config.s3.bucket
         self.prefix = config.s3.prefix
         self.map_version = config.map_version
@@ -115,7 +123,7 @@ class S3TileStorage(TileStorage):
         s3_options = {}
         if config.s3.force_path_style:
             s3_options["s3"] = {"addressing_style": "path"}
-        client_config = Config(signature_version="s3v4", **s3_options)
+        client_config = BotocoreConfig(signature_version="s3v4", **s3_options)
         self.client = boto3.client(
             "s3",
             region_name=config.s3.region,
